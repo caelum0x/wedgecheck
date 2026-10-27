@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+output/
+*.log
+.env
+test_report_output.md

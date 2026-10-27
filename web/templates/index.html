@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Wedgecheck -- sourced market briefs</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 16px; line-height: 1.5; color: #111; }
+    h1 { font-size: 1.4rem; }
+    .lede { color: #555; margin-bottom: 24px; }
+    input, textarea { width: 100%; padding: 10px; margin: 6px 0 16px; box-sizing: border-box; font-size: 1rem; }
+    button { padding: 10px 20px; font-size: 1rem; cursor: pointer; }
+    .error { color: #a00; margin: 16px 0; }
+    .sources { font-size: 0.9rem; color: #444; }
+    .sources a { word-break: break-all; }
+    pre.report { white-space: pre-wrap; background: #fafafa; border: 1px solid #eee; padding: 16px; border-radius: 6px; }
+    .cost { color: #777; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <h1>Wedgecheck</h1>
+  <p class="lede">Every claim below is cited to a real, live source -- gpt-researcher (Apache-2.0) does the retrieval, we never let an LLM invent a competitor or a number.</p>
+
+  <form method="post" action="/">
+    <label>Product URL (optional if you give a description)</label>
+    <input type="url" name="url" placeholder="https://yourproduct.com">
+    <label>Or describe what you're building</label>
+    <textarea name="description" rows="3" placeholder="A hosted Postgres backend for indie SaaS teams, like Supabase but self-hostable"></textarea>
+    <button type="submit">Generate market brief</button>
+  </form>
+
+  {% if error %}
+    <p class="error">{{ error }}</p>
+  {% endif %}
+
+  {% if result %}
+    <h2>{{ result.input.resolved_title or "Market brief" }}</h2>
+    <p class="cost">Research cost: ${{ "%.4f"|format(result.research_cost_usd) }}</p>
+    <pre class="report">{{ result.report_markdown }}</pre>
+    <h3>Sources ({{ result.source_urls|length }})</h3>
+    <ul class="sources">
+      {% for s in result.source_urls %}
+        <li><a href="{{ s }}" target="_blank" rel="noopener">{{ s }}</a></li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</body>
+</html>
