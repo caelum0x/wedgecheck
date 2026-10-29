@@ -37,10 +37,27 @@ Because a redirect can point anywhere, `fetch_public_url()` also follows
 redirects itself, one hop at a time, re-running all three checks before
 every single request -- `requests`' own `allow_redirects=True` is never
 used here (classic SSRF-via-redirect bypass).
+
+A fourth defense, unrelated to SSRF but living here because it's the same
+"public, unauthenticated url fetch" surface: a response-size cap.
+`requests.get()` with its default `stream=False` buffers the entire
+response body into memory before this function (or `product_input.py`)
+ever looks at it, with no limit. A URL that resolves to a perfectly
+public, non-internal address -- so none of the three defenses above would
+ever block it -- but serves a multi-gigabyte body (an attacker's own
+public server, or even just a legitimate but huge file someone pastes in)
+would still get downloaded in full, in this single-uvicorn-worker
+container that runs at ~512MB. That OOMs the one process serving every
+concurrent user, not just the request that triggered it. `fetch_public_url`
+now streams and enforces `WEDGECHECK_MAX_FETCH_BYTES` (default 5MB, well
+over any real HTML page this app needs to extract a title/summary from)
+against both the `Content-Length` header (fast path) and the actual bytes
+read (so a missing or lying header can't bypass it).
 """
 from __future__ import annotations
 
 import ipaddress
+import os
 import socket
 import threading
 from contextlib import contextmanager
@@ -50,6 +67,8 @@ import requests
 
 _ALLOWED_SCHEMES = {"http", "https"}
 _MAX_REDIRECTS = 5
+_MAX_RESPONSE_BYTES = int(os.getenv("WEDGECHECK_MAX_FETCH_BYTES", str(5 * 1024 * 1024)))
+_FETCH_CHUNK_SIZE = 65536
 
 # socket.getaddrinfo is a single process-global function (urllib3's own
 # create_connection() calls the module-qualified `socket.getaddrinfo`, not
@@ -155,6 +174,45 @@ def _pinned_resolution(hostname: str, validated_ips: list[str]):
         socket.getaddrinfo = real_getaddrinfo
 
 
+def _read_capped(response: requests.Response, url: str) -> None:
+    """Materialize `response`'s body into `.content`/`.text`, raising
+    UnsafeUrlError and closing the connection instead of buffering past
+    `_MAX_RESPONSE_BYTES`. Checks the declared Content-Length first (fast,
+    no bytes transferred for an honest oversized response), then enforces
+    the same cap against the real streamed byte count regardless, because
+    a missing or understated Content-Length (chunked transfer, or just a
+    lying server) must not be able to bypass it."""
+    content_length = response.headers.get("Content-Length")
+    if content_length is not None:
+        try:
+            declared = int(content_length)
+        except ValueError:
+            declared = None
+        if declared is not None and declared > _MAX_RESPONSE_BYTES:
+            response.close()
+            raise UnsafeUrlError(
+                f"Response from {url!r} declares Content-Length "
+                f"{declared} bytes, over the {_MAX_RESPONSE_BYTES}-byte "
+                "fetch cap"
+            )
+
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=_FETCH_CHUNK_SIZE):
+        total += len(chunk)
+        if total > _MAX_RESPONSE_BYTES:
+            response.close()
+            raise UnsafeUrlError(
+                f"Response from {url!r} exceeded the {_MAX_RESPONSE_BYTES}-"
+                "byte fetch cap while streaming (no Content-Length, or a "
+                "lying one); refusing to buffer an unbounded body into "
+                "memory"
+            )
+        chunks.append(chunk)
+    response._content = b"".join(chunks)
+    response._content_consumed = True
+
+
 def fetch_public_url(
     url: str, *, headers: dict, timeout: int
 ) -> requests.Response:
@@ -181,14 +239,22 @@ def fetch_public_url(
                     headers=headers,
                     timeout=timeout,
                     allow_redirects=False,
+                    stream=True,
                 )
 
         if response.is_redirect or response.is_permanent_redirect:
             next_url = response.headers.get("Location")
             if not next_url:
+                # No Location to follow -- same edge case as before this
+                # cap existed; still materialize (capped) so raise_for_status
+                # and any later .text/.content access on the returned
+                # response work.
+                _read_capped(response, current_url)
                 response.raise_for_status()
                 return response
+            response.close()  # redirect hop's own body is never used
             current_url = requests.compat.urljoin(current_url, next_url)
             continue
+        _read_capped(response, current_url)
         return response
     raise UnsafeUrlError(f"Too many redirects fetching {url!r}")

@@ -120,6 +120,14 @@ requests per 10 minutes per IP, both tunable
 Exceeding it returns `429` with a `Retry-After` header (JSON for the API, a
 friendly banner for the form). See `app/rate_limit.py`.
 
+The `url` fetch (web form or `/api/brief`) also enforces a response-size
+cap, independent of the SSRF checks: a URL can resolve to a perfectly
+public address and still serve an unbounded body, which would otherwise be
+buffered in full into this single-worker container's memory. Default 5MB,
+tunable via `WEDGECHECK_MAX_FETCH_BYTES`; enforced against both the
+declared `Content-Length` and the real streamed byte count, so a missing
+or lying header can't bypass it. See `app/ssrf_guard.py`.
+
 ## Status
 
 Live at `https://wedgecheck.ereboslab.com` (Docker on the Oracle box,
