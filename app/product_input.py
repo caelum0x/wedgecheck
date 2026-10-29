@@ -2,7 +2,16 @@
 
 No LLM is used here on purpose -- this is plain HTTP + HTML parsing so the
 "what is this product" step never hallucinates. If the page can't be
-fetched, we fail loudly rather than inventing a description.
+fetched *and the caller gave no description either*, we fail loudly rather
+than inventing a description. But if the caller gave both (the web form's
+own label reads "Product URL (optional if you give a description)", and
+`ProductInput.research_subject()` already treats `raw_description` as the
+designed fallback for an empty `resolved_summary`), a url that is
+unreachable, blocked by the SSRF guard, or returns a non-2xx status must
+fall back to the real description instead of discarding it and failing the
+whole request -- confirmed live this was NOT happening before: a DNS
+failure, a 404, and an SSRF block each raised immediately even with a
+perfectly good `description` already in hand.
 
 The URL fetch goes through ssrf_guard.fetch_public_url(), not a bare
 requests.get() -- this is a public, unauthenticated endpoint (the web
@@ -34,6 +43,7 @@ from __future__ import annotations
 
 import os
 
+import requests
 from bs4 import BeautifulSoup
 
 from .schema import ProductInput
@@ -78,9 +88,29 @@ def build_product_input(
             response = fetch_public_url(
                 url, headers={"User-Agent": _USER_AGENT}, timeout=_TIMEOUT_SECONDS
             )
-        except UnsafeUrlError as exc:
+            response.raise_for_status()
+        except (UnsafeUrlError, requests.RequestException) as exc:
+            # The URL itself couldn't be fetched or extracted (SSRF block,
+            # DNS failure, timeout, non-2xx status, ...) -- NOT the same as
+            # "fetched fine but had no extractable text" below, but it must
+            # be handled the same way: if the caller also gave a real
+            # description, that's a genuine, usable fallback (exactly what
+            # ProductInput.research_subject() already falls back to, and
+            # exactly what the web form's own "Product URL (optional if you
+            # give a description)" label promises) rather than discarding a
+            # perfectly good description just because the url happened to be
+            # unreachable/blocked/stale. Only raise -- and only with this
+            # url-specific error, not a generic one -- when there's truly
+            # nothing else to fall back to.
+            if description:
+                return ProductInput(
+                    raw_url=url,
+                    raw_description=description,
+                    resolved_title=None,
+                    resolved_summary=description,
+                )
             raise ValueError(str(exc)) from exc
-        response.raise_for_status()
+
         soup = BeautifulSoup(response.text, "html.parser")
 
         title_tag = soup.find("title")
