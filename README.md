@@ -51,6 +51,13 @@ No paid retriever key is required — `RETRIEVER` defaults to `duckduckgo`
 (free, no key). For more reliable results than the free retriever, set
 `RETRIEVER=tavily` and `TAVILY_API_KEY=...`.
 
+Two more knobs, both passed straight through to gpt-researcher's own
+`MAX_SUBTOPICS`/`LANGUAGE` config: `WEDGECHECK_MAX_SUBTOPICS` (default `3`)
+caps how many subtopics a report breaks into; `WEDGECHECK_REPORT_LANGUAGE`
+(default `english`) is the language the whole report (not just the query)
+is written in — e.g. `WEDGECHECK_REPORT_LANGUAGE=spanish` produces a real
+Spanish-language brief, cited sources and all.
+
 ### Fully free self-host (no paid key at all)
 
 Production (`wedgecheck.ereboslab.com`) runs with **no paid LLM key** —

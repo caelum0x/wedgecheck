@@ -56,6 +56,14 @@ class WedgecheckConfig:
         os.environ.setdefault("FAST_LLM", self.fast_llm)
         os.environ.setdefault("SMART_LLM", self.smart_llm)
         os.environ.setdefault("STRATEGIC_LLM", self.strategic_llm)
+        # gpt-researcher's own Config reads these exact names (MAX_SUBTOPICS,
+        # LANGUAGE) straight from os.environ -- WEDGECHECK_MAX_SUBTOPICS /
+        # WEDGECHECK_REPORT_LANGUAGE were previously parsed into this
+        # dataclass and never actually wired anywhere, so setting either env
+        # var had zero effect on a real report (always 3 subtopics, always
+        # English, regardless of what was configured).
+        os.environ.setdefault("MAX_SUBTOPICS", str(self.max_subtopics))
+        os.environ.setdefault("LANGUAGE", self.report_language)
         # No-op unless WEDGECHECK_NON_STREAMING_LLM=1 -- see llm_compat.py.
         llm_compat.apply_if_enabled()
         # Real upstream bug fix, always applied -- see retriever_compat.py.
