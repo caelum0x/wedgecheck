@@ -128,6 +128,15 @@ tunable via `WEDGECHECK_MAX_FETCH_BYTES`; enforced against both the
 declared `Content-Length` and the real streamed byte count, so a missing
 or lying header can't bypass it. See `app/ssrf_guard.py`.
 
+Both `url` and `description` (web form or `/api/brief`) are length-capped
+before either is used for anything — the rate limiter above only bounds
+*how many* requests a client can make, not how large one is, and an
+oversized `description` would still be handed straight to gpt-researcher
+(real compute/token spend on the shared LLM relay) and persisted to
+sqlite forever. Defaults: 2048 chars for `url`, 4000 chars for
+`description`, tunable via `WEDGECHECK_MAX_URL_CHARS` /
+`WEDGECHECK_MAX_DESCRIPTION_CHARS`. See `app/product_input.py`.
+
 ## Status
 
 Live at `https://wedgecheck.ereboslab.com` (Docker on the Oracle box,
