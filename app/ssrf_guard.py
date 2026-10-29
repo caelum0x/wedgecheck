@@ -102,6 +102,55 @@ resolves to a real public address an attacker controls (so none of the
 first three defenses touch it, and the response is well under the
 response-size cap above) can hold the connection open near-indefinitely
 this way. That matters well beyond "one slow request": `build_product_input()`
+(product_input.py) runs on a worker thread via `asyncio.to_thread()` -- see
+the sixth defense below for the sibling gap this same thread-pool-
+exhaustion risk applies to, one step earlier in the same call.
+
+A sixth defense, found the same way as the fifth (re-examining this exact
+module's own wall-clock-deadline claim after shipping it, not a new file):
+the fifth defense's own deadline tracking starts the clock, but
+`_resolve_and_validate()` -- called once per redirect hop, *before*
+`requests.get()` or `_read_capped()` ever run -- calls the real
+`socket.getaddrinfo()` with no timeout at all. `socket.getaddrinfo()`
+takes no timeout argument; it blocks for however long the OS resolver
+takes, which for a hostname whose authoritative nameserver an attacker
+controls and deliberately never answers (or answers very slowly) is bounded
+only by the resolver's own retry/timeout policy -- not by this module's
+`timeout` parameter, and not by Docker's embedded DNS at 127.0.0.11 inside
+this exact container either (confirmed by reading its own retry/backoff
+behavior; it is not instant on a non-responding upstream). Reproduced live
+against this exact function, same technique as the fifth defense's own
+repro (a synthetic slow dependency swapped in at the real call site, not a
+hypothetical): monkeypatching `_real_getaddrinfo` to sleep 8s before
+resolving proved `fetch_public_url(url, timeout=3)` -- a 3-second budget --
+actually took 8.1s to raise, with the error message claiming "wall-clock
+budget exceeded before the response body could be read", which is simply
+false in this case: no body was ever reached, the entire overrun happened
+inside the supposedly-already-fixed deadline's own first step. Since this
+runs on the same shared default `asyncio.to_thread()` pool the fifth
+defense's own docstring already describes (small, single-digit worker
+threads, shared with `store.save_brief()`/`get_brief()`/
+`list_briefs_for_session()` for every other concurrent user), a handful of
+briefs pointed at hostnames with deliberately unresponsive authoritative
+nameservers can occupy the entire pool this way, identically to the fifth
+defense's own already-fixed scenario -- just one call earlier.
+
+Fixed by running the actual `_real_getaddrinfo()` call on a separate daemon
+thread and waiting on it for at most whatever wall-clock budget remains,
+via a one-slot `queue.Queue.get(timeout=...)` -- `socket.getaddrinfo()`
+itself cannot be interrupted or cancelled once started (no socket exists
+yet to shut down the way the fifth defense's `_force_close_socket` does),
+so a resolution that is still running when the budget runs out is
+abandoned, not killed: the background thread is left to finish on its own
+and is simply never waited on or acted on again (harmless -- it only ever
+writes its result into a queue nothing reads again, and is a daemon thread
+so it cannot block process exit). This bounds the *caller's* wait, which is
+the actual thread-pool-exhaustion risk, even though the orphaned OS-level
+resolution call itself may still be running somewhere underneath.
+`assert_safe_public_url()` (the standalone validator with no fetch and no
+caller-supplied deadline) keeps the old unbounded call -- there is no
+budget to bound it against there, and it was never reachable by a public
+request in the first place.
 (product_input.py) runs on a worker thread via `asyncio.to_thread()`, which
 hands it to the asyncio event loop's *default* `ThreadPoolExecutor` --
 shared, process-wide, with every *other* `asyncio.to_thread()` call in the
@@ -163,6 +212,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import queue
 import socket
 import threading
 import time
@@ -239,15 +289,70 @@ def _is_blocked_ip(ip_text: str) -> bool:
     )
 
 
-def _resolve_and_validate(hostname: str) -> list[str]:
+def _getaddrinfo_with_deadline(hostname: str, deadline: float):
+    """Run the real, blocking `socket.getaddrinfo()` on a separate daemon
+    thread and wait for it for at most whatever wall-clock budget remains
+    before `deadline` -- see module docstring's sixth defense for the real
+    bug this closes: `socket.getaddrinfo()` takes no timeout argument and
+    can block far longer than any `timeout=` this module was given, if the
+    hostname's authoritative nameserver simply never answers.
+
+    `socket.getaddrinfo()` cannot be cancelled or interrupted once started
+    (unlike the fifth defense's socket read, there is no live socket yet to
+    shut down) -- a lookup still running when the budget runs out is
+    abandoned, not killed: the background thread is left to finish (or
+    hang) on its own, writing its eventual result into a queue nothing
+    reads again. This is safe to abandon because it mutates no shared
+    state and is a daemon thread, so it can never block process exit.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise UnsafeUrlError(f"Timed out resolving host {hostname!r}")
+
+    result_q: "queue.Queue[tuple[str, object]]" = queue.Queue(maxsize=1)
+
+    def _resolve():
+        try:
+            result_q.put(("ok", _real_getaddrinfo(hostname, None, 0, socket.SOCK_STREAM)))
+        except Exception as exc:  # re-raised on the waiting thread below
+            result_q.put(("error", exc))
+
+    threading.Thread(target=_resolve, daemon=True).start()
+    try:
+        kind, payload = result_q.get(timeout=remaining)
+    except queue.Empty:
+        raise UnsafeUrlError(
+            f"Timed out resolving host {hostname!r} (DNS lookup exceeded "
+            "the wall-clock fetch budget -- the lookup may still be running "
+            "in the background against an unresponsive or deliberately "
+            "slow-answering nameserver, but this request gives up on it "
+            "rather than holding a worker thread open indefinitely)"
+        )
+    if kind == "error":
+        raise UnsafeUrlError(f"Could not resolve host {hostname!r}") from payload
+    return payload
+
+
+def _resolve_and_validate(hostname: str, *, deadline: float | None = None) -> list[str]:
     """Resolve `hostname` exactly once and raise unless every address it
     maps to is public. Returns the validated IP *literals* -- not raw
     getaddrinfo() tuples, which embed a port (this validation call always
     asks with port=None, but the real connection may want 443/80/etc) --
     so a later connection can be pinned to these exact addresses without
-    ever resolving the hostname a second time."""
+    ever resolving the hostname a second time.
+
+    `deadline` (a `time.monotonic()` timestamp), when given, bounds how
+    long the resolution itself is allowed to take -- see module docstring's
+    sixth defense. Omitted by `assert_safe_public_url()`, the standalone
+    validator with no fetch and therefore no budget to bound against;
+    always supplied by `fetch_public_url()`, the only caller reachable from
+    a public request.
+    """
     try:
-        addrinfo = _real_getaddrinfo(hostname, None, 0, socket.SOCK_STREAM)
+        if deadline is None:
+            addrinfo = _real_getaddrinfo(hostname, None, 0, socket.SOCK_STREAM)
+        else:
+            addrinfo = _getaddrinfo_with_deadline(hostname, deadline)
     except socket.gaierror as exc:
         raise UnsafeUrlError(f"Could not resolve host {hostname!r}") from exc
     if not addrinfo:
@@ -449,7 +554,7 @@ def fetch_public_url(
         if not parsed.hostname:
             raise UnsafeUrlError("URL has no hostname")
 
-        addrinfo = _resolve_and_validate(parsed.hostname)
+        addrinfo = _resolve_and_validate(parsed.hostname, deadline=deadline)
         with _pinned_resolution(parsed.hostname, addrinfo):
             response = requests.get(
                 current_url,
