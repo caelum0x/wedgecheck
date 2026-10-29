@@ -51,6 +51,31 @@ No paid retriever key is required — `RETRIEVER` defaults to `duckduckgo`
 (free, no key). For more reliable results than the free retriever, set
 `RETRIEVER=tavily` and `TAVILY_API_KEY=...`.
 
+### Fully free self-host (no paid key at all)
+
+Production (`wedgecheck.ereboslab.com`) runs with **no paid LLM key** —
+`OPENAI_BASE_URL` points at this portfolio's own free Cloudflare Workers AI
+relay instead of OpenRouter/OpenAI:
+
+```bash
+export OPENAI_API_KEY=<the relay's low-value AI_RELAY_KEY>
+export OPENAI_BASE_URL=https://ai-relay.subasiarhan3.workers.dev/v1
+export EMBEDDING=custom:bge          # relay's /v1/embeddings route (Workers AI bge-base-en-v1.5)
+export WEDGECHECK_NON_STREAMING_LLM=1
+```
+
+Two things make this work that are easy to miss if you swap in a different
+minimal relay:
+
+- The relay always answers a flat JSON body even when the request says
+  `"stream": true` (no real SSE). gpt-researcher's report writer always
+  requests streaming, so without `WEDGECHECK_NON_STREAMING_LLM=1`
+  (`app/llm_compat.py`) you'll see `No generation chunks were returned`.
+- gpt-researcher's embedding step defaults to a paid
+  `openai:text-embedding-3-small`. `EMBEDDING=custom:bge` routes it at the
+  relay's `/v1/embeddings` route instead, so the image never needs
+  torch/sentence-transformers.
+
 ## Usage
 
 CLI:
@@ -73,9 +98,16 @@ uvicorn app.main:app --reload
 
 ## Status
 
-Early-stage, self-hosted, no deploy yet. Known current blocker: the
-OpenRouter key used in dev has exhausted credits (owner billing step, not a
-code issue) — the retry/fail-loud logic above is verified against a mocked
-research engine (both the "recovers on retry" and "fails loud after
-exhausting retries" paths), not yet against a full live run end-to-end,
-pending that credit top-up.
+Live at `https://wedgecheck.ereboslab.com` (Docker on the Oracle box,
+`/opt/infra-box/stacks/wedgecheck`). Verified end-to-end against the real
+code path, not a mock: the retry/fail-loud logic in `app/brief.py` has been
+exercised live, repeatedly, and correctly discards an LLM-written report
+whenever the free `duckduckgo` retriever comes back with zero real sources
+on every attempt (raising `WedgecheckResearchError`) rather than ever
+serving a confidently-written but unsourced brief.
+
+A full success case (non-zero `source_urls`, no exception) depends on the
+free `duckduckgo`/`ddgs` retriever actually returning results for the given
+query at request time, which it does not always do. See
+`~/products/plans/wedgecheck.md` for the live evidence and what's still
+worth doing about retriever reliability (e.g. `RETRIEVER=tavily`).

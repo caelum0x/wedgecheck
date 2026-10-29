@@ -17,6 +17,8 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
+from . import llm_compat
+
 load_dotenv()
 
 
@@ -54,3 +56,5 @@ class WedgecheckConfig:
         os.environ.setdefault("FAST_LLM", self.fast_llm)
         os.environ.setdefault("SMART_LLM", self.smart_llm)
         os.environ.setdefault("STRATEGIC_LLM", self.strategic_llm)
+        # No-op unless WEDGECHECK_NON_STREAMING_LLM=1 -- see llm_compat.py.
+        llm_compat.apply_if_enabled()
