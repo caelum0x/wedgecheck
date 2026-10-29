@@ -16,6 +16,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -65,6 +66,34 @@ def _with_session_cookie(request: Request, response, session_id: str | None = No
             samesite="lax",
         )
     return session_id, response
+
+
+@app.exception_handler(HTTPException)
+async def _html_aware_http_exception_handler(request: Request, exc: HTTPException):
+    """Every *other* error path on `POST /` (rate limit, SSRF, length cap,
+    a failed research pass) is handled inside `submit()` itself and renders
+    the real `index.html` template with a friendly in-page banner -- never
+    raw JSON. But `RequestBodyLimitMiddleware` (body_limit.py) necessarily
+    raises its 413 `HTTPException` from *inside* Starlette's own body
+    parsing, which runs before `submit()`'s own code (and therefore its
+    try/except) ever gets to execute -- so without this handler, FastAPI's
+    default behavior (a bare `{"detail": ...}` JSON body, confirmed live via
+    a real oversized form POST) is the one error response on this exact
+    route that breaks the page instead of rendering the app's own HTML, for
+    no reason other than which layer happened to raise it. `POST /` is the
+    only route this can reach (`/api/brief` and everything else correctly
+    keep the default JSON handling, unchanged)."""
+    if request.method == "POST" and request.url.path == "/":
+        response = templates.TemplateResponse(
+            request,
+            "index.html",
+            {"result": None, "error": str(exc.detail)},
+            status_code=exc.status_code,
+            headers=exc.headers,
+        )
+        _, response = _with_session_cookie(request, response)
+        return response
+    return await http_exception_handler(request, exc)
 
 
 def _brief_view(brief) -> dict:

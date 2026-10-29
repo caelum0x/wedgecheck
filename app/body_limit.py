@@ -37,13 +37,36 @@ live: that's exactly what happened before this was changed to raise
 `HTTPException` directly), while a real `HTTPException` passes through
 unchanged and is handled correctly by Starlette's own `ExceptionMiddleware`
 into the clean `413` this module intends.
+
+The declared-`Content-Length` fast path (zero bytes read off the socket)
+also raises that same `HTTPException` from inside `capped_receive()` now,
+rather than sending a hand-built `JSONResponse` directly from this
+middleware (the original design, which bypassed `self.app()` -- and
+therefore the real FastAPI app, including its exception-handler registry
+-- entirely). That original design meant the one route this app renders as
+a styled HTML page on every other error (`POST /` -- rate limit, SSRF,
+length cap, a failed research pass all render `index.html`'s error banner,
+see `main.py`'s `submit()`) got a bare `{"detail": ...}` JSON body instead
+on exactly this one error path, because it was the only one raised by a
+layer that ran before `submit()`'s own code -- and therefore its own
+try/except -- ever got to execute. Confirmed live: a real oversized `POST
+/` form submission came back `content-type: application/json`, not the
+app's own HTML. Routing *both* checks through `self.app()` means both now
+reach `main.py`'s `_html_aware_http_exception_handler`, which renders the
+real `index.html` error banner for `POST /` specifically and leaves every
+other route's (`/api/brief` included) default JSON `413` untouched. This
+costs nothing in the zero-bytes-transferred guarantee: `capped_receive()`
+still never calls the real `receive()` before raising when `declared` is
+already over the cap, for every request this app actually reads a body on
+(every `POST /` and `POST /api/brief` -- the only two routes with a
+Form/Body parameter at all, so the only two that ever trigger a real
+`receive()` call in the first place).
 """
 from __future__ import annotations
 
 import os
 
 from fastapi import HTTPException
-from starlette.responses import JSONResponse
 
 # Comfortably above the largest legitimate payload this app accepts (a
 # ~4000-char description plus a ~2048-char url plus JSON/multipart
@@ -78,14 +101,24 @@ class RequestBodyLimitMiddleware:
             return
 
         declared = _declared_content_length(scope)
-        if declared is not None and declared > _MAX_REQUEST_BYTES:
-            await self._reject(scope, send, declared)
-            return
-
         total = 0
+        declared_checked = False
 
         async def capped_receive():
-            nonlocal total
+            nonlocal total, declared_checked
+            if not declared_checked:
+                declared_checked = True
+                if declared is not None and declared > _MAX_REQUEST_BYTES:
+                    # Zero bytes read off the socket: reject on the
+                    # declared Content-Length alone, before the real
+                    # receive() is ever called. Only reachable on a route
+                    # that actually reads a body at all (POST / and
+                    # POST /api/brief in this app) -- see module docstring.
+                    raise HTTPException(
+                        413,
+                        f"Request body too large ({declared} declared, max "
+                        f"{_MAX_REQUEST_BYTES})",
+                    )
             message = await receive()
             if message["type"] == "http.request":
                 total += len(message.get("body") or b"")
@@ -98,12 +131,3 @@ class RequestBodyLimitMiddleware:
             return message
 
         await self.app(scope, capped_receive, send)
-
-    @staticmethod
-    async def _reject(scope, send, declared_bytes: int) -> None:
-        detail = (
-            f"Request body too large ({declared_bytes} declared, max "
-            f"{_MAX_REQUEST_BYTES})"
-        )
-        response = JSONResponse({"detail": detail}, status_code=413)
-        await response(scope, receive=None, send=send)

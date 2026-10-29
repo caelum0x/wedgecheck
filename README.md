@@ -152,8 +152,11 @@ at all via chunked transfer, would still be read fully into memory first).
 Default 64KiB, tunable via `WEDGECHECK_MAX_REQUEST_BYTES`; enforced against
 both the declared `Content-Length` (fast path, zero bytes read) and the
 real streamed byte count (so a missing or lying header can't bypass it
-either), same two-layer pattern as the url-fetch cap above. See
-`app/body_limit.py`.
+either), same two-layer pattern as the url-fetch cap above. Hitting this on
+`POST /` renders the same in-page HTML error banner every other error on
+that route does (rate limit, SSRF, length cap, a failed research pass);
+`POST /api/brief` still gets the plain JSON `413` it always did. See
+`app/body_limit.py` and `main.py`'s `_html_aware_http_exception_handler`.
 
 ## Status
 
