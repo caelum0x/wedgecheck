@@ -102,36 +102,51 @@ async def generate_market_brief(
     query = _QUERY_TEMPLATE.format(subject=product_input.research_subject())
 
     last_report_markdown = ""
-    last_cost_usd = 0.0
+    total_cost_usd = 0.0
     attempts = max(1, cfg.research_max_attempts)
 
     for attempt in range(1, attempts + 1):
         report_markdown, source_urls, cost_usd = await _run_one_research_attempt(query)
-        last_report_markdown, last_cost_usd = report_markdown, cost_usd
+        last_report_markdown = report_markdown
+        # Each attempt spins up a fresh GPTResearcher (see
+        # _run_one_research_attempt's own docstring), so get_costs() is
+        # per-attempt, not cumulative across retries -- it must be summed
+        # here. A real LLM call (query planning, and often report writing
+        # too) runs on every attempt regardless of whether that attempt
+        # found any sources, so a failed attempt is not free: a bare
+        # `cost_usd = cost_usd` (or tracking only the last/successful
+        # attempt) silently discards the real spend of every attempt before
+        # it, both in the success case (a brief that recovered on attempt 2
+        # or 3) and in the final-failure error message below (which claims
+        # "cost so far", not "cost of the last attempt").
+        total_cost_usd += cost_usd
 
         if source_urls:
             if attempt > 1:
                 logger.info(
-                    "wedgecheck: research recovered %d source(s) on attempt %d/%d",
+                    "wedgecheck: research recovered %d source(s) on attempt %d/%d "
+                    "(total cost across all attempts: $%.4f)",
                     len(source_urls),
                     attempt,
                     attempts,
+                    total_cost_usd,
                 )
             return MarketBrief(
                 input=product_input,
                 report_markdown=report_markdown,
                 source_urls=source_urls,
-                research_cost_usd=cost_usd,
+                research_cost_usd=total_cost_usd,
             )
 
         logger.warning(
             "wedgecheck: research attempt %d/%d returned 0 source URLs "
-            "(retriever=%s) -- usually the free retriever's own low recall "
-            "on this phrasing, not a rate limit; retrying the identical "
-            "query rarely recovers it",
+            "(retriever=%s, cost so far $%.4f) -- usually the free "
+            "retriever's own low recall on this phrasing, not a rate limit; "
+            "retrying the identical query rarely recovers it",
             attempt,
             attempts,
             cfg.retriever,
+            total_cost_usd,
         )
         if attempt < attempts:
             await asyncio.sleep(cfg.research_retry_backoff_seconds * attempt)
@@ -145,6 +160,6 @@ async def generate_market_brief(
         "helps); try rephrasing the description, or set RETRIEVER to a "
         "different gpt-researcher retriever (e.g. tavily, with "
         "TAVILY_API_KEY set) for more reliable results. (Research cost so "
-        f"far: ${last_cost_usd:.4f}; last report was "
+        f"far: ${total_cost_usd:.4f}; last report was "
         f"{len(last_report_markdown)} chars, discarded.)"
     )
