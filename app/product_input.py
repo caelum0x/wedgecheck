@@ -52,6 +52,28 @@ from .ssrf_guard import UnsafeUrlError, fetch_public_url
 _USER_AGENT = "Wedgecheck/0.1 (+https://github.com/caelum0x/wedgecheck)"
 _TIMEOUT_SECONDS = 15
 _MAX_SUMMARY_CHARS = 1200
+# No real <title> needs more than this -- browsers themselves truncate tab
+# titles well under 100 chars, and nothing legitimate on the web ships a
+# multi-KB <title>. Reproduced live (2026-10-29): resolved_title is the one
+# extracted field that skips the summary join's own [:_MAX_SUMMARY_CHARS]
+# truncation below -- it's assigned straight from `title_tag.get_text()`
+# and stored/rendered completely separately (ProductInput.resolved_title,
+# store.py's own `resolved_title` column, and the bare `{{ result.
+# resolved_title }}`/`{{ b.resolved_title }}` in index.html/history.html).
+# A page whose <title> is a few MB of garbage -- well under the *response*
+# fetch cap (ssrf_guard.py's `_MAX_RESPONSE_BYTES`, 5MB, which has no
+# reason to block a request like this at all) -- gets extracted in full,
+# persisted forever in sqlite (store.save_brief has no length check either),
+# and re-rendered on every future view of that permalink, which is public
+# by design and never expires. Confirmed with a real ~4.8MB <title>: the
+# sqlite row it created was ~4.8MB on disk, and the real index.html
+# template (same Jinja2Templates instance /b/{id} uses) rendered a ~4.8MB
+# HTML page from it -- on a box already noted elsewhere as 91% disk used /
+# 9.1GB free, and within the existing 3-requests/10-min rate limit, that's
+# a few hundred MB/day of real, permanent, publicly-served bloat from one
+# attacker, for a field no legitimate page ever needs more than ~100
+# visible characters of.
+_MAX_TITLE_CHARS = 300
 _MAX_URL_CHARS = int(os.getenv("WEDGECHECK_MAX_URL_CHARS", "2048"))
 _MAX_DESCRIPTION_CHARS = int(os.getenv("WEDGECHECK_MAX_DESCRIPTION_CHARS", "4000"))
 
@@ -114,7 +136,7 @@ def build_product_input(
         soup = BeautifulSoup(response.text, "html.parser")
 
         title_tag = soup.find("title")
-        title = title_tag.get_text(strip=True) if title_tag else None
+        title = title_tag.get_text(strip=True)[:_MAX_TITLE_CHARS] if title_tag else None
 
         meta_description = soup.find("meta", attrs={"name": "description"})
         og_description = soup.find("meta", attrs={"property": "og:description"})
