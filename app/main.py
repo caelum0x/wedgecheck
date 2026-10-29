@@ -45,8 +45,17 @@ def _session_id(request: Request) -> str:
     return request.cookies.get(_SESSION_COOKIE) or uuid.uuid4().hex
 
 
-def _with_session_cookie(request: Request, response):
-    session_id = _session_id(request)
+def _with_session_cookie(request: Request, response, session_id: str | None = None):
+    """Set the session cookie on `response` if the browser doesn't already
+    have it. `session_id` must be the *same* id the caller already used for
+    any store.* call this request made (e.g. submit()'s store.save_brief) --
+    resolving a second, independent `_session_id(request)` here would mint a
+    fresh random uuid distinct from the one just written to the DB, since a
+    cookie set on a response is never visible in request.cookies within that
+    same request/response cycle. Callers with no prior session_id of their
+    own (index(), history()) can omit it and let this resolve one itself."""
+    if session_id is None:
+        session_id = _session_id(request)
     if request.cookies.get(_SESSION_COOKIE) != session_id:
         response.set_cookie(
             _SESSION_COOKIE,
@@ -118,7 +127,7 @@ async def submit(request: Request, url: str = Form(""), description: str = Form(
             status_code=429,
         )
         response.headers["Retry-After"] = str(int(exc.retry_after_seconds))
-        _, response = _with_session_cookie(request, response)
+        _, response = _with_session_cookie(request, response, session_id)
         return response
     try:
         brief = await generate_market_brief(
@@ -128,7 +137,7 @@ async def submit(request: Request, url: str = Form(""), description: str = Form(
         response = templates.TemplateResponse(
             request, "index.html", {"result": None, "error": str(exc)}
         )
-        _, response = _with_session_cookie(request, response)
+        _, response = _with_session_cookie(request, response, session_id)
         return response
 
     brief_id = await asyncio.to_thread(store.save_brief, brief, session_id=session_id)
@@ -138,7 +147,11 @@ async def submit(request: Request, url: str = Form(""), description: str = Form(
         "index.html",
         {"result": _brief_view(brief), "error": None, "permalink": permalink},
     )
-    _, response = _with_session_cookie(request, response)
+    # Must reuse the exact session_id resolved above (and already passed to
+    # store.save_brief) -- see _with_session_cookie's docstring for why
+    # calling _session_id(request) again here would silently orphan the
+    # just-saved brief under a cookie value nobody has.
+    _, response = _with_session_cookie(request, response, session_id)
     return response
 
 
@@ -169,7 +182,7 @@ async def history(request: Request):
     response = templates.TemplateResponse(
         request, "history.html", {"briefs": briefs}
     )
-    _, response = _with_session_cookie(request, response)
+    _, response = _with_session_cookie(request, response, session_id)
     return response
 
 
