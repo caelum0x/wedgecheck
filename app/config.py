@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
-from . import llm_compat
+from . import llm_compat, retriever_compat
 
 load_dotenv()
 
@@ -58,3 +58,5 @@ class WedgecheckConfig:
         os.environ.setdefault("STRATEGIC_LLM", self.strategic_llm)
         # No-op unless WEDGECHECK_NON_STREAMING_LLM=1 -- see llm_compat.py.
         llm_compat.apply_if_enabled()
+        # Real upstream bug fix, always applied -- see retriever_compat.py.
+        retriever_compat.apply()
