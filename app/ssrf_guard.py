@@ -33,6 +33,36 @@ Three defenses, all required:
    which called `socket.getaddrinfo()` once for validation and then threw
    the result away before calling `requests.get()`.)
 
+   `socket.getaddrinfo` is a single process-global function, so pinning
+   it has to be done without letting one request's pin leak onto another
+   request's unrelated hostname. An earlier version of this fix installed
+   and tore down a *global* monkeypatch of `socket.getaddrinfo` around
+   each request, serialized by one process-wide `threading.Lock` held for
+   the pin's entire lifetime -- which, because `requests.get()` itself
+   blocks until the response's status line and headers arrive (not just
+   through DNS resolve + TCP connect), meant that lock was held for the
+   full wait-on-a-slow-server duration, not a quick setup step. Confirmed
+   live against the real production container (see wedgecheck.md's
+   2026-10-29 entry): one in-flight fetch of a deliberately slow but
+   perfectly legitimate URL (`httpbin.org/delay/6`) stalled four
+   concurrent fetches of a completely unrelated, fast host (`example.com`)
+   for the same ~6s, even though none of them shared a hostname and there
+   was no reason for them to wait on each other -- every concurrent
+   brief's url-fetch step was serialized behind whichever one happened to
+   be slowest, for up to `timeout` seconds per redirect hop.
+
+   Fixed by pinning per-thread instead of per-process: `_pin_state` is a
+   `threading.local()`, and the single `socket.getaddrinfo` monkeypatch
+   (installed once, at import time, forever) only intercepts a hostname
+   lookup if the *calling thread* has that exact hostname pinned in its
+   own thread-local slot. Since `requests`/urllib3 does its DNS resolution
+   and connect synchronously on the same thread that called
+   `fetch_public_url()` (this app runs each brief's URL fetch in its own
+   worker thread via `asyncio.to_thread`, see brief.py), the pin is only
+   ever visible to the thread that set it -- closing the exact same
+   DNS-rebinding window as before, with zero cross-thread lock and zero
+   cross-thread stalling.
+
 Because a redirect can point anywhere, `fetch_public_url()` also follows
 redirects itself, one hop at a time, re-running all three checks before
 every single request -- `requests`' own `allow_redirects=True` is never
@@ -70,17 +100,34 @@ _MAX_REDIRECTS = 5
 _MAX_RESPONSE_BYTES = int(os.getenv("WEDGECHECK_MAX_FETCH_BYTES", str(5 * 1024 * 1024)))
 _FETCH_CHUNK_SIZE = 65536
 
-# socket.getaddrinfo is a single process-global function (urllib3's own
-# create_connection() calls the module-qualified `socket.getaddrinfo`, not
-# a name bound at its own import time, which is exactly what makes
-# pinning it from here effective). This app runs each brief's synchronous
-# URL fetch in its own worker thread (asyncio.to_thread, see brief.py), so
-# two concurrent fetch_public_url() calls could otherwise install and tear
-# down competing monkeypatches on that shared global mid-flight -- this
-# lock serializes just the resolve-pin-request sequence (bounded by
-# `timeout` per redirect hop, _MAX_REDIRECTS hops max) across threads, not
-# the rest of the 60-120s research pass.
-_dns_pin_lock = threading.Lock()
+# The real, unpatched resolver -- captured once, at import time, before
+# the module-global monkeypatch below ever runs, so it always reaches the
+# OS/libc resolver directly and never recurses into our own patch.
+_real_getaddrinfo = socket.getaddrinfo
+
+# Per-thread pin slot. See module docstring point 3: `requests`/urllib3
+# resolves and connects synchronously on whichever thread called
+# fetch_public_url(), so pinning per-thread (instead of per-process,
+# behind a lock held for the whole request) closes the DNS-rebinding
+# window with no cross-thread serialization.
+_pin_state = threading.local()
+
+
+def _thread_pinned_getaddrinfo(host, port=None, family=0, type=0, proto=0, flags=0):
+    pinned_hostname = getattr(_pin_state, "hostname", None)
+    if pinned_hostname is not None and host == pinned_hostname:
+        results = []
+        for ip in _pin_state.ips:
+            results.extend(_real_getaddrinfo(ip, port, family, type, proto, flags))
+        return results
+    return _real_getaddrinfo(host, port, family, type, proto, flags)
+
+
+# Installed once, forever, at import time -- not swapped in/out per
+# request. Safe to leave in place process-wide: for any thread that has
+# never entered `_pinned_resolution`, `_pin_state.hostname` is unset and
+# every lookup falls straight through to `_real_getaddrinfo` unchanged.
+socket.getaddrinfo = _thread_pinned_getaddrinfo
 
 
 class UnsafeUrlError(ValueError):
@@ -108,7 +155,7 @@ def _resolve_and_validate(hostname: str) -> list[str]:
     so a later connection can be pinned to these exact addresses without
     ever resolving the hostname a second time."""
     try:
-        addrinfo = socket.getaddrinfo(hostname, None, 0, socket.SOCK_STREAM)
+        addrinfo = _real_getaddrinfo(hostname, None, 0, socket.SOCK_STREAM)
     except socket.gaierror as exc:
         raise UnsafeUrlError(f"Could not resolve host {hostname!r}") from exc
     if not addrinfo:
@@ -149,29 +196,23 @@ def assert_safe_public_url(url: str) -> None:
 @contextmanager
 def _pinned_resolution(hostname: str, validated_ips: list[str]):
     """For the duration of this context, any socket.getaddrinfo(hostname,
-    ...) call anywhere in this process is answered using only the
+    ...) call made *by the current thread* is answered using only the
     already-validated `validated_ips`, instead of performing a fresh DNS
-    lookup of `hostname`. Resolving a literal IP address (as opposed to a
-    hostname) never performs a DNS query -- it's pure local formatting --
-    so re-running getaddrinfo per validated IP here to pick up whatever
-    port/family/type the real caller actually asked for is still exactly
-    one real hostname lookup total, with zero additional rebinding
-    window. Caller must hold _dns_pin_lock -- see module docstring."""
-    real_getaddrinfo = socket.getaddrinfo
-
-    def _patched(host, port=None, family=0, type=0, proto=0, flags=0):
-        if host != hostname:
-            return real_getaddrinfo(host, port, family, type, proto, flags)
-        results = []
-        for ip in validated_ips:
-            results.extend(real_getaddrinfo(ip, port, family, type, proto, flags))
-        return results
-
-    socket.getaddrinfo = _patched
+    lookup of `hostname` -- scoped per-thread (via `_pin_state`), not
+    process-wide, so a concurrent fetch on another thread for a different
+    hostname is never blocked on or affected by this one. Resolving a
+    literal IP address (as opposed to a hostname) never performs a DNS
+    query -- it's pure local formatting -- so re-running getaddrinfo per
+    validated IP here to pick up whatever port/family/type the real
+    caller actually asked for is still exactly one real hostname lookup
+    total, with zero additional rebinding window."""
+    _pin_state.hostname = hostname
+    _pin_state.ips = validated_ips
     try:
         yield
     finally:
-        socket.getaddrinfo = real_getaddrinfo
+        _pin_state.hostname = None
+        _pin_state.ips = None
 
 
 def _read_capped(response: requests.Response, url: str) -> None:
@@ -231,16 +272,15 @@ def fetch_public_url(
         if not parsed.hostname:
             raise UnsafeUrlError("URL has no hostname")
 
-        with _dns_pin_lock:
-            addrinfo = _resolve_and_validate(parsed.hostname)
-            with _pinned_resolution(parsed.hostname, addrinfo):
-                response = requests.get(
-                    current_url,
-                    headers=headers,
-                    timeout=timeout,
-                    allow_redirects=False,
-                    stream=True,
-                )
+        addrinfo = _resolve_and_validate(parsed.hostname)
+        with _pinned_resolution(parsed.hostname, addrinfo):
+            response = requests.get(
+                current_url,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=False,
+                stream=True,
+            )
 
         if response.is_redirect or response.is_permanent_redirect:
             next_url = response.headers.get("Location")
