@@ -12,6 +12,7 @@ id with no auth.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from pathlib import Path
 
@@ -24,6 +25,8 @@ from pydantic import BaseModel
 from . import csrf_guard, rate_limit, store
 from .body_limit import RequestBodyLimitMiddleware
 from .brief import generate_market_brief
+
+logger = logging.getLogger("wedgecheck.main")
 
 app = FastAPI(title="Wedgecheck", version="0.1.0")
 # Caps raw request-body bytes before Starlette/Pydantic ever buffers or
@@ -122,8 +125,13 @@ class BriefRequest(BaseModel):
 
 
 class BriefResponse(BaseModel):
-    id: str
-    permalink_url: str
+    # id/permalink_url are None when store.save_brief() itself failed (disk
+    # full, a permissions slip, sqlite lock contention, ...) -- see
+    # api_brief()'s own try/except below. The report is still real and
+    # already fully paid for regardless of whether persisting it worked, so
+    # it must never be withheld just because the storage side-effect failed.
+    id: str | None
+    permalink_url: str | None
     report_markdown: str
     source_urls: list[str]
     research_cost_usd: float
@@ -173,8 +181,28 @@ async def submit(request: Request, url: str = Form(""), description: str = Form(
         _, response = _with_session_cookie(request, response, session_id)
         return response
 
-    brief_id = await asyncio.to_thread(store.save_brief, brief, session_id=session_id)
-    permalink = str(request.url_for("view_permalink", brief_id=brief_id))
+    # A completed brief is already fully paid for (real research cost on
+    # the shared LLM relay) -- a storage failure here (disk full, a
+    # permissions slip, sqlite lock contention, ...) must never discard it.
+    # store.py's own docstring (from the earlier fd-leak fix pass) flagged
+    # this exact gap as still open and unfixed. Reproduced live with a real
+    # sqlite3.OperationalError (chmod'd the db file read-only, then hit
+    # this route with generate_market_brief stubbed to skip the real
+    # network call): before this try/except, the exception from
+    # store.save_brief() propagated unhandled straight through this route
+    # into FastAPI's default 500 "Internal Server Error", throwing away
+    # the real report the user just paid 60-120s of real compute for, for
+    # a persistence-layer problem that has nothing to do with whether the
+    # research itself succeeded.
+    try:
+        brief_id = await asyncio.to_thread(store.save_brief, brief, session_id=session_id)
+        permalink = str(request.url_for("view_permalink", brief_id=brief_id))
+    except Exception:
+        logger.exception(
+            "wedgecheck: store.save_brief failed on POST / -- showing the "
+            "real report anyway (no permalink, won't appear in /history)"
+        )
+        permalink = None
     response = templates.TemplateResponse(
         request,
         "index.html",
@@ -239,8 +267,23 @@ async def api_brief(request: Request, payload: BriefRequest):
         raise HTTPException(502, f"Research failed: {exc}") from exc
     # API callers have no session cookie of their own -- still persisted
     # (session_id=None) so the permalink in the response works for anyone.
-    brief_id = await asyncio.to_thread(store.save_brief, brief, session_id=None)
-    permalink = str(request.url_for("view_permalink", brief_id=brief_id))
+    #
+    # Same "never discard an already-paid-for result" fix as submit()'s
+    # POST / handler above: a storage failure here must not turn a real,
+    # completed, already-paid-for brief into a 500 that throws the whole
+    # report away -- it's strictly worse than submit()'s case, since the
+    # caller gets *nothing at all* back instead of a page rendered without
+    # a permalink banner. id/permalink_url are just None when this fails.
+    brief_id: str | None = None
+    permalink: str | None = None
+    try:
+        brief_id = await asyncio.to_thread(store.save_brief, brief, session_id=None)
+        permalink = str(request.url_for("view_permalink", brief_id=brief_id))
+    except Exception:
+        logger.exception(
+            "wedgecheck: store.save_brief failed on POST /api/brief -- "
+            "returning the real report anyway (id/permalink_url null)"
+        )
     return BriefResponse(
         id=brief_id,
         permalink_url=permalink,
