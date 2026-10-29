@@ -77,7 +77,15 @@ async def generate_market_brief(
     cfg = config or WedgecheckConfig.from_env()
     cfg.apply_to_environ()
 
-    product_input = build_product_input(url=url, description=description)
+    # build_product_input() does a synchronous `requests.get()` (see
+    # product_input.py) -- called directly from this async function it would
+    # block the entire single-worker event loop (and therefore every other
+    # concurrent request, including /healthz) for up to its own 15s timeout.
+    # Confirmed live: a URL pointed at a slow-responding page froze a
+    # concurrent /healthz call for ~7.6s. Run it in a thread instead.
+    product_input = await asyncio.to_thread(
+        build_product_input, url=url, description=description
+    )
     query = _QUERY_TEMPLATE.format(subject=product_input.research_subject())
 
     last_report_markdown = ""
