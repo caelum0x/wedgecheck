@@ -14,28 +14,54 @@ that is theoretical -- it was reproduced live against this app's own
 `127.0.0.1` listener before this fix (see wedgecheck.md's 2026-10-29
 entry).
 
-Two defenses, both required:
+Three defenses, all required:
 1. Scheme must be http/https (blocks `file://`, custom handlers, etc).
 2. Every IP the hostname resolves to must be a real public, routable
    address -- not loopback, private (RFC1918), link-local (incl. the
    cloud-metadata /16), multicast, reserved, or unspecified.
+3. The actual TCP connection reuses the *exact* address list this module
+   already resolved and validated, instead of letting `requests`/urllib3
+   re-resolve the hostname independently a moment later. Without this,
+   steps 1-2 are a check-then-fetch pattern with a real DNS-rebinding
+   bypass: an attacker who controls the authoritative DNS for the
+   hostname can answer the validation lookup with a public IP and the
+   separate connection lookup -- made by urllib3 inside `requests.get()`
+   -- with `127.0.0.1` / `169.254.169.254` / an internal container IP,
+   walking straight past steps 1-2. (This is the standard SSRF-via-
+   DNS-rebinding technique and applies to any "validate, then separately
+   connect" URL guard -- including the first version of this module,
+   which called `socket.getaddrinfo()` once for validation and then threw
+   the result away before calling `requests.get()`.)
 
-Because step 2 only validates the *first* request, a 3xx redirect to a
-blocked address would otherwise bypass it (classic SSRF-via-redirect).
-`fetch_public_url()` therefore follows redirects itself, one hop at a
-time, re-validating the new target before every single request --
-`requests`' own `allow_redirects=True` is never used here.
+Because a redirect can point anywhere, `fetch_public_url()` also follows
+redirects itself, one hop at a time, re-running all three checks before
+every single request -- `requests`' own `allow_redirects=True` is never
+used here (classic SSRF-via-redirect bypass).
 """
 from __future__ import annotations
 
 import ipaddress
 import socket
+import threading
+from contextlib import contextmanager
 from urllib.parse import urlparse
 
 import requests
 
 _ALLOWED_SCHEMES = {"http", "https"}
 _MAX_REDIRECTS = 5
+
+# socket.getaddrinfo is a single process-global function (urllib3's own
+# create_connection() calls the module-qualified `socket.getaddrinfo`, not
+# a name bound at its own import time, which is exactly what makes
+# pinning it from here effective). This app runs each brief's synchronous
+# URL fetch in its own worker thread (asyncio.to_thread, see brief.py), so
+# two concurrent fetch_public_url() calls could otherwise install and tear
+# down competing monkeypatches on that shared global mid-flight -- this
+# lock serializes just the resolve-pin-request sequence (bounded by
+# `timeout` per redirect hop, _MAX_REDIRECTS hops max) across threads, not
+# the rest of the 60-120s research pass.
+_dns_pin_lock = threading.Lock()
 
 
 class UnsafeUrlError(ValueError):
@@ -55,44 +81,108 @@ def _is_blocked_ip(ip_text: str) -> bool:
     )
 
 
+def _resolve_and_validate(hostname: str) -> list[str]:
+    """Resolve `hostname` exactly once and raise unless every address it
+    maps to is public. Returns the validated IP *literals* -- not raw
+    getaddrinfo() tuples, which embed a port (this validation call always
+    asks with port=None, but the real connection may want 443/80/etc) --
+    so a later connection can be pinned to these exact addresses without
+    ever resolving the hostname a second time."""
+    try:
+        addrinfo = socket.getaddrinfo(hostname, None, 0, socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise UnsafeUrlError(f"Could not resolve host {hostname!r}") from exc
+    if not addrinfo:
+        raise UnsafeUrlError(f"Host {hostname!r} resolved to no addresses")
+    ips = []
+    for info in addrinfo:
+        ip_text = info[4][0]
+        if _is_blocked_ip(ip_text):
+            raise UnsafeUrlError(
+                f"Host {hostname!r} resolves to a non-public address "
+                f"({ip_text}); refusing to fetch internal infrastructure"
+            )
+        ips.append(ip_text)
+    return ips
+
+
 def assert_safe_public_url(url: str) -> None:
     """Raise UnsafeUrlError unless `url` is http(s) and every address its
-    hostname resolves to is a public, non-internal IP. Call this again
-    before *each* request in a redirect chain -- never trust a prior
-    check for a new URL."""
+    hostname resolves to is a public, non-internal IP.
+
+    Standalone validation only -- does NOT protect against the DNS-
+    rebinding bypass described above, because a caller that uses this and
+    then separately opens its own connection will still re-resolve the
+    hostname independently. `fetch_public_url()` below does not call this;
+    it runs its own resolve-and-pin sequence so the hostname is only ever
+    resolved once per request. Kept as a public helper only for pure
+    validation use cases that never make a network request off the
+    result.
+    """
     parsed = urlparse(url)
     if parsed.scheme not in _ALLOWED_SCHEMES:
         raise UnsafeUrlError(f"Unsupported URL scheme: {parsed.scheme!r}")
     if not parsed.hostname:
         raise UnsafeUrlError("URL has no hostname")
+    _resolve_and_validate(parsed.hostname)
 
+
+@contextmanager
+def _pinned_resolution(hostname: str, validated_ips: list[str]):
+    """For the duration of this context, any socket.getaddrinfo(hostname,
+    ...) call anywhere in this process is answered using only the
+    already-validated `validated_ips`, instead of performing a fresh DNS
+    lookup of `hostname`. Resolving a literal IP address (as opposed to a
+    hostname) never performs a DNS query -- it's pure local formatting --
+    so re-running getaddrinfo per validated IP here to pick up whatever
+    port/family/type the real caller actually asked for is still exactly
+    one real hostname lookup total, with zero additional rebinding
+    window. Caller must hold _dns_pin_lock -- see module docstring."""
+    real_getaddrinfo = socket.getaddrinfo
+
+    def _patched(host, port=None, family=0, type=0, proto=0, flags=0):
+        if host != hostname:
+            return real_getaddrinfo(host, port, family, type, proto, flags)
+        results = []
+        for ip in validated_ips:
+            results.extend(real_getaddrinfo(ip, port, family, type, proto, flags))
+        return results
+
+    socket.getaddrinfo = _patched
     try:
-        addrinfo = socket.getaddrinfo(parsed.hostname, None)
-    except socket.gaierror as exc:
-        raise UnsafeUrlError(f"Could not resolve host {parsed.hostname!r}") from exc
-
-    resolved_ips = {info[4][0] for info in addrinfo}
-    if not resolved_ips:
-        raise UnsafeUrlError(f"Host {parsed.hostname!r} resolved to no addresses")
-    for ip_text in resolved_ips:
-        if _is_blocked_ip(ip_text):
-            raise UnsafeUrlError(
-                f"Host {parsed.hostname!r} resolves to a non-public address "
-                f"({ip_text}); refusing to fetch internal infrastructure"
-            )
+        yield
+    finally:
+        socket.getaddrinfo = real_getaddrinfo
 
 
 def fetch_public_url(
     url: str, *, headers: dict, timeout: int
 ) -> requests.Response:
-    """requests.get(), but re-validated before every redirect hop so a
-    public-looking URL can't 3xx its way into an internal address."""
+    """requests.get(), but every redirect hop is resolved, validated, and
+    then pinned to that exact validated address before the real request
+    is made. Closes both the classic SSRF-via-redirect bypass (each hop
+    is independently validated) and the SSRF-via-DNS-rebinding bypass
+    (each hop's actual TCP connection reuses its own validation lookup
+    instead of letting the HTTP client re-resolve the hostname a second
+    time, independently, a moment later)."""
     current_url = url
     for _ in range(_MAX_REDIRECTS + 1):
-        assert_safe_public_url(current_url)
-        response = requests.get(
-            current_url, headers=headers, timeout=timeout, allow_redirects=False
-        )
+        parsed = urlparse(current_url)
+        if parsed.scheme not in _ALLOWED_SCHEMES:
+            raise UnsafeUrlError(f"Unsupported URL scheme: {parsed.scheme!r}")
+        if not parsed.hostname:
+            raise UnsafeUrlError("URL has no hostname")
+
+        with _dns_pin_lock:
+            addrinfo = _resolve_and_validate(parsed.hostname)
+            with _pinned_resolution(parsed.hostname, addrinfo):
+                response = requests.get(
+                    current_url,
+                    headers=headers,
+                    timeout=timeout,
+                    allow_redirects=False,
+                )
+
         if response.is_redirect or response.is_permanent_redirect:
             next_url = response.headers.get("Location")
             if not next_url:
