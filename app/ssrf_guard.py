@@ -86,6 +86,78 @@ now streams and enforces `WEDGECHECK_MAX_FETCH_BYTES` (default 5MB, well
 over any real HTML page this app needs to extract a title/summary from)
 against both the `Content-Length` header (fast path) and the actual bytes
 read (so a missing or lying header can't bypass it).
+
+A fifth defense: a real wall-clock deadline on the whole fetch, separate
+from (and not satisfied by) the `timeout=` already passed to every
+`requests.get()` call above. `requests`'/urllib3's "timeout" is a
+*per-socket-read* timeout, not a total-duration one -- confirmed live with
+a throwaway local TCP server that sends valid HTTP headers, then the body
+one single byte at a time with a `time.sleep()` between each byte well
+under the configured timeout: `requests.get(url, timeout=15, stream=True)`
+followed by reading `.content`/iterating `iter_content()` took the full
+57+ seconds to materialize a 20-byte body, never once raising, because
+every individual `recv()` arrived comfortably inside the 15s window --
+only the gap *between* reads is timed, never the sum of them. A URL that
+resolves to a real public address an attacker controls (so none of the
+first three defenses touch it, and the response is well under the
+response-size cap above) can hold the connection open near-indefinitely
+this way. That matters well beyond "one slow request": `build_product_input()`
+(product_input.py) runs on a worker thread via `asyncio.to_thread()`, which
+hands it to the asyncio event loop's *default* `ThreadPoolExecutor` --
+shared, process-wide, with every *other* `asyncio.to_thread()` call in the
+app, including `store.save_brief()`/`get_brief()`/`list_briefs_for_session()`
+for every other user's completely unrelated request. That default pool is
+small (`min(32, os.cpu_count() + 4)` -- single digits on this box's vCPU
+count). A handful of concurrent briefs pointed at attacker-controlled
+trickling URLs can occupy every worker thread the whole process has, with
+nothing on this path currently able to time it out -- stalling `/history`,
+`/b/{id}`, and every in-flight brief's own save, not just the attacker's
+own slow fetch. Fixed by tracking one monotonic deadline across the entire
+`fetch_public_url()` call -- every redirect hop's own `requests.get()`
+gets whatever time remains (not the full budget again), and the
+`_read_capped()` streaming loop checks the same deadline after every
+chunk, closing the connection and raising once the real wall-clock budget
+(the same `timeout` seconds the caller already asked for) is used up,
+regardless of how innocently-paced each individual byte was.
+
+Getting that deadline actually enforced took a second, less obvious step:
+a plain per-chunk check inside the `iter_content()` loop is not enough on
+its own. `http.client`'s own `_safe_read()` loops *internally*,
+accumulating up to `min(chunk_size, bytes remaining per the attacker's own
+declared Content-Length)` bytes across as many slow individual socket
+reads as it takes, and only returns control to our loop (where a
+per-chunk check would run) once that whole amount is assembled. Since the
+attacker also controls Content-Length, they can simply declare a value at
+or below whatever chunk_size this module picks, and the entire body comes
+back as a *single* chunk no matter how many seconds it's spread across --
+confirmed live: with only a per-chunk deadline check and the original 64KB
+chunk size, a 40-byte body trickled 1 byte every 3s still took the full
+117s to time out, not the ~10s budget asked for (shrinking chunk_size
+doesn't close this either -- it only shifts which small Content-Length
+value the attacker needs to declare to defeat it, confirmed the same way
+down to chunk_size=1, which does close it but costs ~400x throughput on a
+real fast response -- a 2MB fast local reply went from 12ms to 4.7s,
+measured live -- an unacceptable trade on a 512MB single-worker box for
+every legitimate fetch, to guard against an attacker who doesn't need it).
+
+Fixed with a real interrupt instead: a `threading.Timer`, armed for
+whatever time remains until `deadline` before the blocking read begins,
+whose callback (`_force_close_socket`) reaches into the live socket (not
+just `response.close()`, which was tried and confirmed live to do nothing
+to an already-blocked read -- it only marks the response object closed
+for *later* use, the in-progress `recv()` on the reading thread doesn't
+notice and keeps blocking until the attacker's trickle finishes on its
+own) and calls the real `socket.shutdown(SHUT_RDWR)` on it. That reliably
+interrupts a blocked `recv()` on the thread stuck inside it, surfacing as
+a normal `requests.exceptions.RequestException` (confirmed live: the same
+40-byte/3s-per-byte repro now raises in ~5s, matching the timer, not
+117s) -- which `_read_capped` catches and re-raises as `UnsafeUrlError`
+only if the deadline had genuinely passed (any other, unrelated
+connection error still propagates normally). The timer is cancelled in a
+`finally` the instant a real read finishes, so the normal/fast case pays
+only the cost of arming and cancelling one timer -- full chunk-size
+throughput is unaffected, confirmed live (2MB fast local reply still
+~12ms with this fix in place).
 """
 from __future__ import annotations
 
@@ -93,6 +165,7 @@ import ipaddress
 import os
 import socket
 import threading
+import time
 from contextlib import contextmanager
 from urllib.parse import urlparse
 
@@ -234,14 +307,61 @@ def _pinned_resolution(hostname: str, validated_ips: list[str]):
         _pin_state.ips = None
 
 
-def _read_capped(response: requests.Response, url: str) -> None:
+def _force_close_socket(response: requests.Response) -> None:
+    """Best-effort hard interrupt for a streaming read blocked inside
+    `response.iter_content()` on *another* thread -- called only from the
+    `threading.Timer` armed by `_read_capped` below, once `deadline` has
+    actually passed.
+
+    `response.close()` alone does not do this: confirmed live, calling it
+    from a watchdog thread while the real reading thread was blocked
+    inside a slow trickle had no effect at all until the trickle finished
+    on its own -- `close()` just marks the response object closed for
+    later use, it doesn't touch the live, already-blocked `recv()`.
+    Reaching into the real underlying socket and calling the stdlib
+    `shutdown(SHUT_RDWR)` on it does reliably interrupt that blocked read
+    (confirmed live: raises on the reading thread within the timer's own
+    delay, not after the attacker's trickle finishes) -- this is the
+    standard way to cancel a blocking socket op from a different thread.
+
+    The attribute path below is requests/urllib3/http.client internals,
+    not a public API -- confirmed against this project's exact pinned
+    versions (requests==2.34.2, urllib3==2.8.0, see requirements.txt). If
+    a future dependency bump changes this shape, this becomes a silent
+    no-op (broad except, by design) rather than a crash; re-verify this
+    path still resolves whenever either pin moves.
+    """
+    try:
+        response.raw._fp.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+
+
+def _read_capped(response: requests.Response, url: str, deadline: float) -> None:
     """Materialize `response`'s body into `.content`/`.text`, raising
     UnsafeUrlError and closing the connection instead of buffering past
-    `_MAX_RESPONSE_BYTES`. Checks the declared Content-Length first (fast,
-    no bytes transferred for an honest oversized response), then enforces
-    the same cap against the real streamed byte count regardless, because
-    a missing or understated Content-Length (chunked transfer, or just a
-    lying server) must not be able to bypass it."""
+    `_MAX_RESPONSE_BYTES` -- or past `deadline` (a `time.monotonic()`
+    timestamp; see module docstring's fifth defense). Checks the declared
+    Content-Length first (fast, no bytes transferred for an honest
+    oversized response), then enforces the same byte cap against the real
+    streamed byte count regardless, because a missing or understated
+    Content-Length (chunked transfer, or just a lying server) must not be
+    able to bypass it.
+
+    The wall-clock deadline is enforced by arming a `threading.Timer` for
+    whatever time remains, before the (potentially slow-trickled, blocking)
+    read begins -- not just a check between chunks, which a server that
+    also controls Content-Length can trivially dodge by declaring a body
+    no bigger than one chunk (see module docstring's fifth defense for the
+    live repro). If the timer fires, `_force_close_socket` interrupts the
+    in-progress read from outside it, which surfaces here as a normal
+    `requests.exceptions.RequestException` -- re-raised as `UnsafeUrlError`
+    only when `deadline` had genuinely passed (anything else -- a real,
+    unrelated connection drop before the deadline -- propagates as-is, same
+    as before this fix existed). The timer is always cancelled in `finally`
+    so the normal/fast case pays only the cost of arming + cancelling one
+    timer, not any change to real throughput.
+    """
     content_length = response.headers.get("Content-Length")
     if content_length is not None:
         try:
@@ -256,19 +376,43 @@ def _read_capped(response: requests.Response, url: str) -> None:
                 "fetch cap"
             )
 
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        response.close()
+        raise UnsafeUrlError(
+            f"Timed out fetching {url!r} (wall-clock budget exceeded "
+            "before the response body could be read)"
+        )
+    timer = threading.Timer(remaining, _force_close_socket, args=(response,))
+    timer.daemon = True
+    timer.start()
+
     chunks: list[bytes] = []
     total = 0
-    for chunk in response.iter_content(chunk_size=_FETCH_CHUNK_SIZE):
-        total += len(chunk)
-        if total > _MAX_RESPONSE_BYTES:
-            response.close()
+    try:
+        for chunk in response.iter_content(chunk_size=_FETCH_CHUNK_SIZE):
+            total += len(chunk)
+            if total > _MAX_RESPONSE_BYTES:
+                response.close()
+                raise UnsafeUrlError(
+                    f"Response from {url!r} exceeded the "
+                    f"{_MAX_RESPONSE_BYTES}-byte fetch cap while streaming "
+                    "(no Content-Length, or a lying one); refusing to "
+                    "buffer an unbounded body into memory"
+                )
+            chunks.append(chunk)
+    except requests.exceptions.RequestException as exc:
+        if time.monotonic() >= deadline:
             raise UnsafeUrlError(
-                f"Response from {url!r} exceeded the {_MAX_RESPONSE_BYTES}-"
-                "byte fetch cap while streaming (no Content-Length, or a "
-                "lying one); refusing to buffer an unbounded body into "
-                "memory"
-            )
-        chunks.append(chunk)
+                f"Response from {url!r} took too long to fully download "
+                "(wall-clock fetch budget exceeded while streaming -- each "
+                "individual read was fast enough to dodge the socket "
+                "timeout, but the total time was not, so the connection "
+                "was forcibly closed); refusing to hold it open any longer"
+            ) from exc
+        raise
+    finally:
+        timer.cancel()
     response._content = b"".join(chunks)
     response._content_consumed = True
 
@@ -282,9 +426,23 @@ def fetch_public_url(
     is independently validated) and the SSRF-via-DNS-rebinding bypass
     (each hop's actual TCP connection reuses its own validation lookup
     instead of letting the HTTP client re-resolve the hostname a second
-    time, independently, a moment later)."""
+    time, independently, a moment later).
+
+    `timeout` is treated as the real total wall-clock budget for the
+    *whole* call (every redirect hop, every streamed chunk) -- not just
+    the per-socket-read timeout `requests` itself enforces. See module
+    docstring's fifth defense for why that distinction matters: a slow-
+    trickling attacker server can dodge a plain `requests.get(timeout=...)`
+    forever without this."""
+    deadline = time.monotonic() + timeout
     current_url = url
     for _ in range(_MAX_REDIRECTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise UnsafeUrlError(
+                f"Timed out fetching {url!r} (wall-clock budget of "
+                f"{timeout}s exceeded)"
+            )
         parsed = urlparse(current_url)
         if parsed.scheme not in _ALLOWED_SCHEMES:
             raise UnsafeUrlError(f"Unsupported URL scheme: {parsed.scheme!r}")
@@ -296,7 +454,7 @@ def fetch_public_url(
             response = requests.get(
                 current_url,
                 headers=headers,
-                timeout=timeout,
+                timeout=remaining,
                 allow_redirects=False,
                 stream=True,
             )
@@ -308,12 +466,12 @@ def fetch_public_url(
                 # cap existed; still materialize (capped) so raise_for_status
                 # and any later .text/.content access on the returned
                 # response work.
-                _read_capped(response, current_url)
+                _read_capped(response, current_url, deadline)
                 response.raise_for_status()
                 return response
             response.close()  # redirect hop's own body is never used
             current_url = requests.compat.urljoin(current_url, next_url)
             continue
-        _read_capped(response, current_url)
+        _read_capped(response, current_url, deadline)
         return response
     raise UnsafeUrlError(f"Too many redirects fetching {url!r}")
