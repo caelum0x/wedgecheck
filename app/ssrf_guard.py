@@ -18,7 +18,10 @@ Three defenses, all required:
 1. Scheme must be http/https (blocks `file://`, custom handlers, etc).
 2. Every IP the hostname resolves to must be a real public, routable
    address -- not loopback, private (RFC1918), link-local (incl. the
-   cloud-metadata /16), multicast, reserved, or unspecified.
+   cloud-metadata /16), multicast, reserved, unspecified, or any other
+   range `ipaddress`'s own `is_global` knows isn't public (e.g. RFC 6598
+   Shared Address Space, 100.64.0.0/10 -- see `_is_blocked_ip`'s own
+   comment for why `is_private` alone misses that one).
 3. The actual TCP connection reuses the *exact* address list this module
    already resolved and validated, instead of letting `requests`/urllib3
    re-resolve the hostname independently a moment later. Without this,
@@ -144,6 +147,22 @@ def _is_blocked_ip(ip_text: str) -> bool:
         or ip.is_multicast
         or ip.is_reserved
         or ip.is_unspecified
+        # `ip.is_private` does NOT cover every non-publicly-routable range --
+        # confirmed live against this exact module, running inside the real
+        # production container: `ipaddress.ip_address("100.64.0.1").is_private`
+        # is False, so a hostname resolving anywhere in 100.64.0.0/10 (RFC
+        # 6598 "Shared Address Space", reserved for carrier-grade NAT and
+        # widely used inside cloud providers' own internal networks) sailed
+        # straight past every check above and `assert_safe_public_url()`
+        # reported it as a safe public address. `ip.is_global` *does* know
+        # about this range (`is_global` is False for it) -- added as a
+        # catch-all on top of, not instead of, the explicit checks above:
+        # `ip.is_global` is also False for multicast (e.g. 224.0.0.1), which
+        # the explicit `is_multicast` check above already correctly blocks,
+        # so this can only ever block *more* addresses than before, never
+        # fewer -- an OR of the two cannot un-block anything the old code
+        # already caught.
+        or not ip.is_global
     )
 
 
