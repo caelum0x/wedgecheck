@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from urllib.parse import urlparse
 
 from gpt_researcher import GPTResearcher
 
@@ -46,6 +47,61 @@ from .product_input import build_product_input
 from .schema import MarketBrief
 
 logger = logging.getLogger("wedgecheck.brief")
+
+_SAFE_SOURCE_SCHEMES = {"http", "https"}
+
+
+def _filter_safe_source_urls(source_urls: list[str]) -> list[str]:
+    """Drop any "source URL" that isn't http(s) before it ever reaches
+    Wedgecheck's own code paths (the API response, sqlite, and -- the
+    concrete, reproduced-live risk -- `index.html`/`history.html`
+    rendering it straight into `href="{{ s }}"`).
+
+    `researcher.get_source_urls()` returns `self.visited_urls`, which
+    gpt_researcher's own `_extract_content()` (skills/researcher.py)
+    populates from `result["href"]` for every retriever result with zero
+    scheme or host validation -- the free `duckduckgo` retriever is the
+    default here, but nothing upstream guarantees every entry is a real
+    `http(s)` link. Every *other* URL touchpoint in this app is validated
+    (`ssrf_guard.py` for the input `url`, each redirect hop re-validated,
+    the response-size cap) except this one: the *output* source list was
+    rendered completely unvalidated.
+
+    Confirmed live against this app's own real `index.html` template
+    (not a mock): handing it `source_urls=["javascript:alert(1)"]`
+    renders `<a href="javascript:alert(1)" ...>` verbatim -- Jinja's
+    autoescaping blocks HTML-markup injection but does nothing for a
+    dangerous *scheme* inside an attribute value, so a single
+    non-http(s) entry becomes a real clickable XSS payload. This is
+    worse than a one-shot API response: `/b/{id}` permalinks (added this
+    product's earlier session) persist and publicly share this exact
+    rendering forever, to anyone with the link, not just the original
+    caller.
+
+    A "source" that isn't http(s) was never a real citeable source
+    anyway -- dropping it (not sanitizing/escaping it for display) keeps
+    this consistent with the product's own "every claim is cited to a
+    real source" promise, and lets a result that filters down to zero
+    sources fall through the existing, already-correct 0-sources
+    retry/fail-loud path below rather than silently serving a brief with
+    a source quietly removed."""
+    safe = []
+    for url in source_urls:
+        try:
+            scheme = urlparse(url).scheme.lower()
+        except ValueError:
+            continue
+        if scheme in _SAFE_SOURCE_SCHEMES:
+            safe.append(url)
+        else:
+            logger.warning(
+                "wedgecheck: dropped a non-http(s) source URL returned by "
+                "the retriever (scheme=%r) before it could reach any "
+                "render path: %r",
+                scheme,
+                url,
+            )
+    return safe
 
 _QUERY_TEMPLATE = """\
 Market and competitive brief for the following product/business:
@@ -77,7 +133,7 @@ async def _run_one_research_attempt(
 
     costs = researcher.get_costs()
     cost_usd = float(costs) if isinstance(costs, (int, float)) else 0.0
-    source_urls = researcher.get_source_urls()
+    source_urls = _filter_safe_source_urls(researcher.get_source_urls())
     return report_markdown, source_urls, cost_usd
 
 
