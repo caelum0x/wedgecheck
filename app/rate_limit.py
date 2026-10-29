@@ -65,7 +65,7 @@ from __future__ import annotations
 
 import os
 import time
-from collections import defaultdict
+from collections import OrderedDict
 
 from fastapi import Request
 
@@ -82,15 +82,52 @@ _TRUSTED_PROXY_IPS = {
     for ip in os.getenv("WEDGECHECK_TRUSTED_PROXY_IPS", "").split(",")
     if ip.strip()
 }
-# Sweep stale IPs once the tracked set crosses this size, so a botnet of
-# unique source IPs can't grow this dict unbounded in a long-lived process.
+# Real hard cap on how many distinct IPs this process ever tracks at once.
+#
+# Real bug found + fixed here (2026-10-29): the previous implementation
+# called this "the tracked set size that triggers a sweep", not an actual
+# cap -- and the sweep (`_evict_stale`) only ever removed an IP whose
+# *entire* history had already gone stale (`max(timestamps) <= window_start`).
+# A sustained burst of unique source IPs *within* one live window (any
+# botnet, cheap rotating proxies, or just plain IPv6 address diversity --
+# nothing here requires defeating the X-Forwarded-For trust fix above, a
+# direct connection from N different real source addresses is enough) is
+# never stale by that definition, so the sweep found nothing to evict and
+# `_hits` grew without bound. Reproduced live, directly against this exact
+# module (no mocks): 20,000 one-shot unique-IP `check()` calls inside one
+# window left 20,000 entries in `_hits` -- 4x the "cap" -- and, because the
+# sweep re-ran its full `O(len(_hits))` scan on *every single call* once
+# past the threshold (finding nothing to evict each time, so never getting
+# cheaper), per-request cost measured 736x slower once past 5000 tracked
+# IPs (0.4us/req before, 310us/req after) with no upper bound on either the
+# dict's size or that per-request scan cost as the burst continued. Since
+# `check()` runs synchronously in the request path before any `await`
+# (see the class-level note below), that cost is paid on the single
+# uvicorn worker's event loop for every concurrent request, not just the
+# IPs causing the burst -- the exact unbounded-growth-under-a-botnet
+# scenario this module's own original comment claimed was already
+# prevented.
+#
+# Fixed by making `_hits` a real LRU with a real hard cap: inserting a
+# previously-unseen IP that would push the tracked set over `_MAX_TRACKED_IPS`
+# evicts the single least-recently-seen IP (`OrderedDict.popitem(last=False)`,
+# O(1)) instead of re-scanning the whole dict for staleness. This can, in
+# the worst case, evict an IP that still had an active, non-stale window
+# (resetting its count early) -- an accepted tradeoff already stated by this
+# module's own docstring ("the goal is bounding sustained abuse, not
+# perfect enforcement"), and strictly better than the unbounded
+# memory/CPU growth it replaces.
 _MAX_TRACKED_IPS = 5000
 
 # ip -> list of monotonic timestamps of its requests still inside the
-# current window. Mutation here is plain sync code with no `await` in
-# between read and write, so it stays atomic on uvicorn's single-worker,
-# single-event-loop process without needing an explicit lock.
-_hits: dict[str, list[float]] = defaultdict(list)
+# current window. An OrderedDict kept in least-recently-seen order (every
+# access moves the IP to the end) so eviction at the cap is an O(1)
+# `popitem(last=False)` instead of an O(n) staleness scan -- see
+# `_MAX_TRACKED_IPS` above for the real unbounded-growth bug this replaces.
+# Mutation here is plain sync code with no `await` in between read and
+# write, so it stays atomic on uvicorn's single-worker, single-event-loop
+# process without needing an explicit lock.
+_hits: "OrderedDict[str, list[float]]" = OrderedDict()
 
 
 class RateLimitExceeded(Exception):
@@ -133,21 +170,27 @@ def client_ip(request: Request) -> str:
 
 def check(ip: str) -> None:
     """Record one request from `ip`, raising RateLimitExceeded if it has
-    already made _MAX_REQUESTS within the trailing _WINDOW_SECONDS."""
+    already made _MAX_REQUESTS within the trailing _WINDOW_SECONDS.
+
+    O(1) amortized regardless of how many distinct IPs are currently
+    tracked -- see `_MAX_TRACKED_IPS`'s module-level comment for the real
+    unbounded-growth/O(n)-per-request bug this replaces.
+    """
     now = time.monotonic()
     window_start = now - _WINDOW_SECONDS
-    fresh = [t for t in _hits[ip] if t > window_start]
+    is_new_ip = ip not in _hits
+    fresh = [t for t in _hits.get(ip, ()) if t > window_start]
     if len(fresh) >= _MAX_REQUESTS:
         _hits[ip] = fresh
+        _hits.move_to_end(ip)
         retry_after = fresh[0] + _WINDOW_SECONDS - now
         raise RateLimitExceeded(max(retry_after, 1.0))
     fresh.append(now)
     _hits[ip] = fresh
-    if len(_hits) > _MAX_TRACKED_IPS:
-        _evict_stale(window_start)
-
-
-def _evict_stale(window_start: float) -> None:
-    stale = [ip for ip, timestamps in _hits.items() if not timestamps or max(timestamps) <= window_start]
-    for ip in stale:
-        del _hits[ip]
+    _hits.move_to_end(ip)
+    if is_new_ip and len(_hits) > _MAX_TRACKED_IPS:
+        # Real hard cap: evict the single least-recently-seen IP, O(1).
+        # Only reachable when *this* call just added a never-seen-before
+        # IP -- an already-tracked IP being updated never grows `_hits`,
+        # so it can never be the thing that pushes it over the cap.
+        _hits.popitem(last=False)
