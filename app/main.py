@@ -21,7 +21,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from . import rate_limit, store
+from . import csrf_guard, rate_limit, store
 from .body_limit import RequestBodyLimitMiddleware
 from .brief import generate_market_brief
 
@@ -139,6 +139,10 @@ def index(request: Request):
 
 @app.post("/", response_class=HTMLResponse)
 async def submit(request: Request, url: str = Form(""), description: str = Form("")):
+    # Checked first, before rate_limit.check() reserves any of the real
+    # client's quota -- see csrf_guard.py's module docstring for the real,
+    # reproduced-live cross-site POST / gap this closes.
+    csrf_guard.assert_same_site(request)
     session_id = _session_id(request)
     try:
         rate_limit.check(rate_limit.client_ip(request))
