@@ -19,9 +19,12 @@ COPY app ./app
 COPY web ./web
 COPY cli.py ./cli.py
 
-# Writable at runtime for cli.py's ./output/ (the web app itself doesn't need
-# it, but keep the dir present and writable either way).
-RUN mkdir -p /app/output && useradd -u 10001 -m wedgecheck \
+# Writable at runtime for cli.py's ./output/ (the web app itself doesn't
+# need it, but keep the dir present and writable either way) and for
+# app/store.py's SQLite DB (./data/wedgecheck.db by default -- WEDGECHECK_DB_PATH
+# to relocate it). Mount a volume at /app/data in production or saved
+# briefs/permalinks won't survive a container recreate.
+RUN mkdir -p /app/output /app/data && useradd -u 10001 -m wedgecheck \
     && chown -R wedgecheck:wedgecheck /app
 USER wedgecheck
 

@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 output/
+data/
 *.log
 .env
 test_report_output.md

@@ -15,12 +15,19 @@
     .sources a { word-break: break-all; }
     pre.report { white-space: pre-wrap; background: #fafafa; border: 1px solid #eee; padding: 16px; border-radius: 6px; }
     .cost { color: #777; font-size: 0.85rem; }
+    .nav { font-size: 0.9rem; margin-bottom: 8px; }
+    .permalink { background: #f3f7ff; border: 1px solid #d7e3ff; border-radius: 6px; padding: 10px 12px; margin: 16px 0; font-size: 0.9rem; word-break: break-all; }
+    .shared-banner { background: #fff8e6; border: 1px solid #ffe3a3; border-radius: 6px; padding: 10px 12px; margin-bottom: 16px; font-size: 0.9rem; }
   </style>
 </head>
 <body>
+  <p class="nav"><a href="/">Wedgecheck</a> &middot; <a href="/history">My past briefs</a></p>
   <h1>Wedgecheck</h1>
   <p class="lede">Every claim below is cited to a real, live source -- gpt-researcher (Apache-2.0) does the retrieval, we never let an LLM invent a competitor or a number.</p>
 
+  {% if readonly %}
+    <p class="shared-banner">You're viewing a shared, read-only market brief. <a href="/">Generate your own &rarr;</a></p>
+  {% else %}
   <form method="post" action="/">
     <label>Product URL (optional if you give a description)</label>
     <input type="url" name="url" placeholder="https://yourproduct.com">
@@ -28,14 +35,18 @@
     <textarea name="description" rows="3" placeholder="A hosted Postgres backend for indie SaaS teams, like Supabase but self-hostable"></textarea>
     <button type="submit">Generate market brief</button>
   </form>
+  {% endif %}
 
   {% if error %}
     <p class="error">{{ error }}</p>
   {% endif %}
 
   {% if result %}
-    <h2>{{ result.input.resolved_title or "Market brief" }}</h2>
+    <h2>{{ result.resolved_title or "Market brief" }}</h2>
     <p class="cost">Research cost: ${{ "%.4f"|format(result.research_cost_usd) }}</p>
+    {% if permalink %}
+      <p class="permalink">Permalink: <a href="{{ permalink }}">{{ permalink }}</a></p>
+    {% endif %}
     <pre class="report">{{ result.report_markdown }}</pre>
     <h3>Sources ({{ result.source_urls|length }})</h3>
     <ul class="sources">

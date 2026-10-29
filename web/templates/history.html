@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Your past briefs -- Wedgecheck</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 16px; line-height: 1.5; color: #111; }
+    h1 { font-size: 1.4rem; }
+    .lede { color: #555; margin-bottom: 24px; }
+    .nav { font-size: 0.9rem; margin-bottom: 8px; }
+    ul.briefs { list-style: none; padding: 0; }
+    ul.briefs li { padding: 12px 0; border-bottom: 1px solid #eee; }
+    ul.briefs a { font-size: 1rem; text-decoration: none; color: #1a56db; }
+    ul.briefs a:hover { text-decoration: underline; }
+    .meta { color: #777; font-size: 0.85rem; margin-top: 2px; }
+    .empty { color: #555; }
+  </style>
+</head>
+<body>
+  <p class="nav"><a href="/">Wedgecheck</a> &middot; My past briefs</p>
+  <h1>Your past briefs</h1>
+  <p class="lede">Scoped to this browser only (an anonymous cookie, no account) -- so a brief isn't lost just because the tab closed.</p>
+
+  {% if briefs %}
+    <ul class="briefs">
+      {% for b in briefs %}
+        <li>
+          <a href="/b/{{ b.id }}">{{ b.resolved_title or b.description or b.url or "Untitled brief" }}</a>
+          <div class="meta">{{ b.generated_at }} &middot; ${{ "%.4f"|format(b.research_cost_usd) }}</div>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="empty">No briefs yet from this browser. <a href="/">Generate your first one</a>.</p>
+  {% endif %}
+</body>
+</html>

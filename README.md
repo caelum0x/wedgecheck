@@ -96,6 +96,21 @@ uvicorn app.main:app --reload
 `GET /` — single-form UI. `POST /api/brief` — JSON API
 (`{"url": "..."}` or `{"description": "..."}`). `GET /healthz` — health check.
 
+Every completed brief (web form or `/api/brief`) is persisted to a local
+SQLite DB (`app/store.py`, path via `WEDGECHECK_DB_PATH`, default
+`./data/wedgecheck.db`) so it isn't lost after one request/session:
+
+- `GET /b/{id}` — a shareable permalink for one completed report. The
+  `/api/brief` JSON response now includes `id` and `permalink_url`.
+  Permalinks are public by id (no auth) — see `app/store.py`'s docstring
+  for why that's the right tradeoff here.
+- `GET /history` — a browser's own past briefs, scoped to an anonymous
+  session cookie (`wedgecheck_session`, no account system). Linked from
+  every page's nav.
+
+In Docker, mount a volume at `/app/data` or these survive only until the
+next container recreate.
+
 ## Status
 
 Live at `https://wedgecheck.ereboslab.com` (Docker on the Oracle box,
