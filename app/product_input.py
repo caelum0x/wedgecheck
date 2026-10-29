@@ -3,13 +3,21 @@
 No LLM is used here on purpose -- this is plain HTTP + HTML parsing so the
 "what is this product" step never hallucinates. If the page can't be
 fetched, we fail loudly rather than inventing a description.
+
+The URL fetch goes through ssrf_guard.fetch_public_url(), not a bare
+requests.get() -- this is a public, unauthenticated endpoint (the web
+form and /api/brief both take an arbitrary `url`), so without that guard
+anyone could make this box fetch its own internal infrastructure (other
+containers, loopback services, the cloud metadata address). See
+ssrf_guard.py's docstring for the real, reproduced-live vulnerability
+this closes.
 """
 from __future__ import annotations
 
-import requests
 from bs4 import BeautifulSoup
 
 from .schema import ProductInput
+from .ssrf_guard import UnsafeUrlError, fetch_public_url
 
 _USER_AGENT = "Wedgecheck/0.1 (+https://github.com/caelum0x/wedgecheck)"
 _TIMEOUT_SECONDS = 15
@@ -34,9 +42,12 @@ def build_product_input(
     summary: str | None = None
 
     if url:
-        response = requests.get(
-            url, headers={"User-Agent": _USER_AGENT}, timeout=_TIMEOUT_SECONDS
-        )
+        try:
+            response = fetch_public_url(
+                url, headers={"User-Agent": _USER_AGENT}, timeout=_TIMEOUT_SECONDS
+            )
+        except UnsafeUrlError as exc:
+            raise ValueError(str(exc)) from exc
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
 
