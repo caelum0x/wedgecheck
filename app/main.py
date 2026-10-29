@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from . import store
+from . import rate_limit, store
 from .brief import generate_market_brief
 
 app = FastAPI(title="Wedgecheck", version="0.1.0")
@@ -98,6 +98,24 @@ def index(request: Request):
 async def submit(request: Request, url: str = Form(""), description: str = Form("")):
     session_id = _session_id(request)
     try:
+        rate_limit.check(rate_limit.client_ip(request))
+    except rate_limit.RateLimitExceeded as exc:
+        response = templates.TemplateResponse(
+            request,
+            "index.html",
+            {
+                "result": None,
+                "error": (
+                    "Too many briefs from this connection -- each one runs a "
+                    f"real research pass. Try again in about {exc.retry_after_seconds:.0f}s."
+                ),
+            },
+            status_code=429,
+        )
+        response.headers["Retry-After"] = str(int(exc.retry_after_seconds))
+        _, response = _with_session_cookie(request, response)
+        return response
+    try:
         brief = await generate_market_brief(
             url=url.strip() or None, description=description.strip() or None
         )
@@ -154,6 +172,14 @@ async def history(request: Request):
 async def api_brief(request: Request, payload: BriefRequest):
     if not payload.url and not payload.description:
         raise HTTPException(400, "Provide url or description")
+    try:
+        rate_limit.check(rate_limit.client_ip(request))
+    except rate_limit.RateLimitExceeded as exc:
+        raise HTTPException(
+            429,
+            f"Rate limit exceeded -- retry after {exc.retry_after_seconds:.0f}s",
+            headers={"Retry-After": str(int(exc.retry_after_seconds))},
+        ) from exc
     try:
         brief = await generate_market_brief(
             url=payload.url, description=payload.description

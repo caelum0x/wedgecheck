@@ -111,6 +111,15 @@ SQLite DB (`app/store.py`, path via `WEDGECHECK_DB_PATH`, default
 In Docker, mount a volume at `/app/data` or these survive only until the
 next container recreate.
 
+`POST /` and `POST /api/brief` are rate-limited per client IP (read from
+`X-Forwarded-For`, falling back to the raw socket peer) — each one is a real
+60–120s research pass against the shared LLM relay, so an unlimited public
+endpoint is a real abuse/cost vector, not a hypothetical one. Default: 3
+requests per 10 minutes per IP, both tunable
+(`WEDGECHECK_RATE_LIMIT_MAX_REQUESTS`, `WEDGECHECK_RATE_LIMIT_WINDOW_SECONDS`).
+Exceeding it returns `429` with a `Retry-After` header (JSON for the API, a
+friendly banner for the form). See `app/rate_limit.py`.
+
 ## Status
 
 Live at `https://wedgecheck.ereboslab.com` (Docker on the Oracle box,
