@@ -125,14 +125,24 @@ SQLite DB (`app/store.py`, path via `WEDGECHECK_DB_PATH`, default
 In Docker, mount a volume at `/app/data` or these survive only until the
 next container recreate.
 
-`POST /` and `POST /api/brief` are rate-limited per client IP (read from
-`X-Forwarded-For`, falling back to the raw socket peer) — each one is a real
-60–120s research pass against the shared LLM relay, so an unlimited public
-endpoint is a real abuse/cost vector, not a hypothetical one. Default: 3
-requests per 10 minutes per IP, both tunable
+`POST /` and `POST /api/brief` are rate-limited per client IP — each one is a
+real 60–120s research pass against the shared LLM relay, so an unlimited
+public endpoint is a real abuse/cost vector, not a hypothetical one. Default:
+3 requests per 10 minutes per IP, both tunable
 (`WEDGECHECK_RATE_LIMIT_MAX_REQUESTS`, `WEDGECHECK_RATE_LIMIT_WINDOW_SECONDS`).
 Exceeding it returns `429` with a `Retry-After` header (JSON for the API, a
-friendly banner for the form). See `app/rate_limit.py`.
+friendly banner for the form).
+
+The IP used for that limit is the raw socket peer by default — `X-Forwarded-
+For` is only honored when the immediate connecting peer is listed in
+`WEDGECHECK_TRUSTED_PROXY_IPS` (comma-separated, empty/unset by default).
+Trusting that header unconditionally (the old behavior) let *any* direct
+connection — including another container on the same shared `products-net`
+docker network, bypassing Caddy entirely — self-assign a fresh rate-limit
+bucket per request just by setting its own header, a complete bypass of the
+limiter. See `app/rate_limit.py` for the full writeup and how to set this in
+production (confirm Caddy's actual peer address as seen inside the
+container, typically the docker bridge gateway, not `127.0.0.1`).
 
 The `url` fetch (web form or `/api/brief`) also enforces a response-size
 cap, independent of the SSRF checks: a URL can resolve to a perfectly
