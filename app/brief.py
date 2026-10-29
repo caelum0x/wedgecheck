@@ -10,15 +10,28 @@ gpt-researcher fires several sub-queries concurrently against the retriever
 (see gpt_researcher/skills/researcher.py's asyncio.gather fan-out). The free
 "duckduckgo" retriever (ddgs) has no retry of its own and silently swallows
 any error into an empty result list (see
-gpt_researcher/retrievers/duckduckgo/duckduckgo.py), so a transient rate
-limit on that concurrent burst can come back as zero sources for the *whole*
-report with no exception raised anywhere. Left unchecked, that produces a
-confident-looking but entirely unsourced report -- the exact failure this
-product exists to prevent. generate_market_brief() below retries the full
-research pass (a fresh GPTResearcher -> fresh retriever session) with a
-backoff on an empty source list, and raises WedgecheckResearchError instead
-of returning an unsourced MarketBrief if every attempt still comes back
-empty.
+gpt_researcher/retrievers/duckduckgo/duckduckgo.py), so zero sources can come
+back for the *whole* report with no exception raised anywhere. Left
+unchecked, that produces a confident-looking but entirely unsourced report --
+the exact failure this product exists to prevent. generate_market_brief()
+below retries the full research pass (a fresh GPTResearcher -> fresh
+retriever session) with a backoff on an empty source list, and raises
+WedgecheckResearchError instead of returning an unsourced MarketBrief if
+every attempt still comes back empty.
+
+Retrying does NOT reliably fix this, and the error message below must not
+claim otherwise. An earlier version of this module (and this comment)
+assumed the cause was "a transient rate limit," written before
+retriever_compat.py's real root-cause fix (the ddgs `region="wt-wt"` DNS bug,
+which *was* a 100%-reproducible hard failure, now patched out). Once that bug
+was fixed, "0 sources after N attempts" kept happening anyway on certain
+phrasings -- confirmed live, twice, in two separate sessions, against the
+identical description ("a simple habit tracker app for iOS") returning 0
+sources on every one of 3 attempts both times. A rate limit would not fail
+the exact same query deterministically across separate sessions; this is the
+free DuckDuckGo HTML retriever's own low recall on some phrasings, which
+retrying the identical query does not fix. Rephrasing the query or setting
+RETRIEVER=tavily are the two things that actually help.
 """
 from __future__ import annotations
 
@@ -113,8 +126,9 @@ async def generate_market_brief(
 
         logger.warning(
             "wedgecheck: research attempt %d/%d returned 0 source URLs "
-            "(retriever=%s) -- likely a transient retriever rate limit, "
-            "not a real zero-result query",
+            "(retriever=%s) -- usually the free retriever's own low recall "
+            "on this phrasing, not a rate limit; retrying the identical "
+            "query rarely recovers it",
             attempt,
             attempts,
             cfg.retriever,
@@ -126,9 +140,11 @@ async def generate_market_brief(
         f"gpt-researcher returned 0 source URLs after {attempts} attempt(s) "
         f"using retriever={cfg.retriever!r}. Refusing to return an unsourced "
         "report -- every Wedgecheck claim must be grounded in a real source. "
-        "This is usually a transient rate limit on the free retriever; retry "
-        "again shortly, or set RETRIEVER to a different gpt-researcher "
-        "retriever (e.g. tavily, with TAVILY_API_KEY set) for more reliable "
-        f"results. (Research cost so far: ${last_cost_usd:.4f}; last report "
-        f"was {len(last_report_markdown)} chars, discarded.)"
+        "This is usually the free retriever's own low recall on this exact "
+        "phrasing (not a rate limit -- retrying the same wording rarely "
+        "helps); try rephrasing the description, or set RETRIEVER to a "
+        "different gpt-researcher retriever (e.g. tavily, with "
+        "TAVILY_API_KEY set) for more reliable results. (Research cost so "
+        f"far: ${last_cost_usd:.4f}; last report was "
+        f"{len(last_report_markdown)} chars, discarded.)"
     )

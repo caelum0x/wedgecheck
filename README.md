@@ -19,11 +19,18 @@ Wedgecheck's own code only does two things:
 
 gpt-researcher fires several sub-queries concurrently. The free
 `duckduckgo` retriever (`ddgs`) has no retry of its own and silently turns
-any error into an empty result list — a transient rate limit on that
-concurrent burst can come back as **zero sources for the whole report, with
-no exception raised anywhere**. Left unchecked this produces a confident,
-detailed, fully invented report with "Sources (0)" quietly sitting at the
-bottom — the exact failure this product exists to prevent.
+any error into an empty result list — which can come back as **zero
+sources for the whole report, with no exception raised anywhere**. Left
+unchecked this produces a confident, detailed, fully invented report with
+"Sources (0)" quietly sitting at the bottom — the exact failure this
+product exists to prevent.
+
+This is usually the free retriever's own low recall on a given phrasing,
+not a rate limit — retrying the identical query rarely helps (confirmed
+live: the same description failed with zero sources on every attempt,
+reproduced deterministically across separate sessions). Rephrasing the
+description, or setting `RETRIEVER=tavily`, actually helps; waiting and
+resubmitting the same text usually doesn't.
 
 `generate_market_brief()` retries the full research pass (a fresh
 `GPTResearcher`, so a fresh retriever session) with backoff whenever a pass
