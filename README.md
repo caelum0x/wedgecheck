@@ -144,6 +144,17 @@ sqlite forever. Defaults: 2048 chars for `url`, 4000 chars for
 `description`, tunable via `WEDGECHECK_MAX_URL_CHARS` /
 `WEDGECHECK_MAX_DESCRIPTION_CHARS`. See `app/product_input.py`.
 
+The raw HTTP request body itself (`POST /` and `POST /api/brief`) is also
+capped, independent of the field-length check above — that check only runs
+*after* FastAPI has already buffered and parsed the entire body (so an
+oversized hidden/extra JSON field, or a body sent with no `Content-Length`
+at all via chunked transfer, would still be read fully into memory first).
+Default 64KiB, tunable via `WEDGECHECK_MAX_REQUEST_BYTES`; enforced against
+both the declared `Content-Length` (fast path, zero bytes read) and the
+real streamed byte count (so a missing or lying header can't bypass it
+either), same two-layer pattern as the url-fetch cap above. See
+`app/body_limit.py`.
+
 ## Status
 
 Live at `https://wedgecheck.ereboslab.com` (Docker on the Oracle box,

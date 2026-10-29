@@ -21,9 +21,14 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from . import rate_limit, store
+from .body_limit import RequestBodyLimitMiddleware
 from .brief import generate_market_brief
 
 app = FastAPI(title="Wedgecheck", version="0.1.0")
+# Caps raw request-body bytes before Starlette/Pydantic ever buffers or
+# parses them -- see body_limit.py's module docstring for the real OOM
+# class this closes that the field-length cap (da61f0b) doesn't.
+app.add_middleware(RequestBodyLimitMiddleware)
 templates = Jinja2Templates(directory=str(Path(__file__).parent.parent / "web" / "templates"))
 
 # Fast, one-time (CREATE TABLE/INDEX IF NOT EXISTS) -- safe to run at import
