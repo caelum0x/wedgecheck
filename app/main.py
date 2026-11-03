@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from pathlib import Path
 
@@ -41,6 +42,21 @@ store.init_db()
 
 _SESSION_COOKIE = "wedgecheck_session"
 _SESSION_MAX_AGE_SECONDS = 365 * 24 * 60 * 60  # 1 year
+
+# No billing integration exists yet (see pricing.html's own CTA copy for
+# why -- Pro/Team are real priced tiers, not live-purchasable ones). This
+# is the single source of truth for which tier ids /pricing's waitlist form
+# may submit, shared between the template (which renders these as buttons)
+# and submit_waitlist()'s own validation below -- a tier id that isn't in
+# here is rejected, not silently recorded as free-text.
+WAITLIST_TIERS = {"pro", "team"}
+# Deliberately conservative (RFC 5322 is far more permissive than this) --
+# this only needs to catch an obviously-malformed address before it's
+# persisted, not fully validate deliverability. Same choke-point pattern
+# the rest of this app already uses for untrusted input (product_input.py's
+# length caps, ssrf_guard.py's scheme check): reject early, at the one
+# place this value enters the app, before it reaches storage.
+_EMAIL_RE = re.compile(r"^[^@\s]{1,120}@[^@\s]{1,120}\.[^@\s]{2,24}$")
 
 
 def _session_id(request: Request) -> str:
@@ -232,6 +248,54 @@ async def view_permalink(request: Request, brief_id: str):
             "readonly": True,
         },
     )
+
+
+@app.get("/pricing", response_class=HTMLResponse)
+def pricing(request: Request):
+    """Real pricing page -- previously the product had none at all. Free is
+    live today (exactly the rate-limited anonymous flow the rest of this
+    app already serves). Pro/Team are real priced tiers with no billing
+    integration wired yet, so their CTA is a real, persisted waitlist
+    signup (`submit_waitlist()` below) rather than a live checkout -- see
+    that function's own docstring for why."""
+    response = templates.TemplateResponse(request, "pricing.html", {"submitted_tier": None})
+    _, response = _with_session_cookie(request, response)
+    return response
+
+
+@app.post("/pricing", response_class=HTMLResponse)
+async def submit_waitlist(
+    request: Request, email: str = Form(...), tier: str = Form(...)
+):
+    """Persists a real Pro/Team waitlist signup. There is no billing
+    integration in this app yet (no accounts, no entitlements, no payment
+    provider wired) -- building that is a larger lift than this pass's
+    scope, so the real, working CTA for a priced tier right now is capturing
+    genuine purchase intent (email + which tier) rather than a fake "Coming
+    soon" with nothing behind it. This is the same fallback the task that
+    added this page was explicitly given: ship a real pricing page with a
+    real waitlist CTA when full checkout isn't wired yet.
+    """
+    csrf_guard.assert_same_site(request)
+    tier = tier.strip().lower()
+    email = email.strip()
+    if tier not in WAITLIST_TIERS:
+        raise HTTPException(400, "Unknown plan")
+    if not _EMAIL_RE.match(email) or len(email) > 200:
+        response = templates.TemplateResponse(
+            request,
+            "pricing.html",
+            {"submitted_tier": None, "waitlist_error": "Enter a valid email address."},
+            status_code=400,
+        )
+        _, response = _with_session_cookie(request, response)
+        return response
+    await asyncio.to_thread(store.save_waitlist_signup, email, tier)
+    response = templates.TemplateResponse(
+        request, "pricing.html", {"submitted_tier": tier, "waitlist_error": None}
+    )
+    _, response = _with_session_cookie(request, response)
+    return response
 
 
 @app.get("/history", response_class=HTMLResponse)

@@ -28,6 +28,7 @@ import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .schema import MarketBrief
@@ -48,6 +49,15 @@ CREATE TABLE IF NOT EXISTS briefs (
 );
 CREATE INDEX IF NOT EXISTS idx_briefs_session
     ON briefs (session_id, generated_at DESC);
+
+CREATE TABLE IF NOT EXISTS waitlist_signups (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_waitlist_created
+    ON waitlist_signups (created_at DESC);
 """
 
 
@@ -170,3 +180,26 @@ def list_briefs_for_session(session_id: str, *, limit: int = 20) -> list[dict]:
             (session_id, limit),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def save_waitlist_signup(email: str, tier: str) -> str:
+    """Persist one real pricing-page waitlist signup (Pro/Team interest --
+    there is no billing integration yet, see pricing.html's own module
+    comment in main.py for why this is the real CTA for now instead of a
+    live checkout). Returns the new row's id.
+
+    Caller (`main.py`'s `submit_waitlist()`) is responsible for validating
+    `email`/`tier` before this is ever called -- this function only
+    persists, it does not re-validate, matching `save_brief()`'s own
+    division of labor in this module.
+    """
+    signup_id = uuid.uuid4().hex
+    with _connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO waitlist_signups (id, email, tier, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (signup_id, email, tier, datetime.now(timezone.utc).isoformat()),
+        )
+    return signup_id

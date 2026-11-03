@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Pricing -- Wedgecheck</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; max-width: 920px; margin: 40px auto; padding: 0 16px; line-height: 1.5; color: #111; }
+    h1 { font-size: 1.4rem; }
+    .lede { color: #555; margin-bottom: 32px; max-width: 640px; }
+    .nav { font-size: 0.9rem; margin-bottom: 8px; }
+    .tiers { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin: 24px 0 32px; }
+    .tier { border: 1px solid #e3e3e3; border-radius: 10px; padding: 20px; display: flex; flex-direction: column; }
+    .tier.featured { border-color: #1a56db; box-shadow: 0 0 0 1px #1a56db inset; }
+    .tier h2 { font-size: 1.05rem; margin: 0 0 4px; }
+    .tier .price { font-size: 1.6rem; font-weight: 600; margin: 4px 0 12px; }
+    .tier .price small { font-size: 0.85rem; font-weight: 400; color: #777; }
+    .tier ul { padding-left: 18px; margin: 0 0 16px; font-size: 0.9rem; color: #333; flex-grow: 1; }
+    .tier li { margin-bottom: 6px; }
+    .tier .badge { display: inline-block; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: #1a56db; background: #eef2ff; border-radius: 4px; padding: 2px 6px; margin-bottom: 8px; width: fit-content; }
+    .tier a.cta, .tier button.cta { display: block; text-align: center; padding: 10px; border-radius: 6px; text-decoration: none; font-size: 0.95rem; cursor: pointer; border: 1px solid #111; background: #111; color: #fff; }
+    .tier.secondary a.cta, .tier.secondary button.cta { background: #fff; color: #111; }
+    .waitlist-form { display: flex; gap: 6px; }
+    .waitlist-form input[type="email"] { flex: 1; padding: 8px; font-size: 0.9rem; border: 1px solid #ccc; border-radius: 6px; }
+    .waitlist-form button { padding: 8px 14px; font-size: 0.9rem; }
+    .error { color: #a00; margin: 16px 0; }
+    .success { background: #f0faf0; border: 1px solid #c9e8c9; border-radius: 6px; padding: 10px 12px; margin: 16px 0; font-size: 0.9rem; }
+    .faq { margin-top: 40px; }
+    .faq h3 { font-size: 1rem; margin-bottom: 4px; }
+    .faq p { color: #444; font-size: 0.9rem; margin-top: 0; margin-bottom: 20px; }
+  </style>
+</head>
+<body>
+  <p class="nav"><a href="/">Wedgecheck</a> &middot; <a href="/pricing">Pricing</a> &middot; <a href="/history">My past briefs</a></p>
+  <h1>Pricing</h1>
+  <p class="lede">Every brief is a real, cited research pass -- never an LLM guess. Start free, upgrade when you need more briefs per day or team-wide access.</p>
+
+  {% if submitted_tier %}
+    <p class="success">You're on the {{ submitted_tier|capitalize }} waitlist -- we'll email you the moment checkout opens, with founder pricing for joining early.</p>
+  {% endif %}
+  {% if waitlist_error %}
+    <p class="error">{{ waitlist_error }}</p>
+  {% endif %}
+
+  <div class="tiers">
+    <div class="tier secondary">
+      <span class="badge">Live today</span>
+      <h2>Free</h2>
+      <div class="price">$0</div>
+      <ul>
+        <li>3 market briefs every 10 minutes</li>
+        <li>Full cited report -- real sources, no invented competitors</li>
+        <li>Shareable permalink for every brief</li>
+        <li>Browser history (last 20 briefs, no account needed)</li>
+        <li>JSON API (<code>/api/brief</code>) at the same rate limit</li>
+      </ul>
+      <a class="cta" href="/">Generate a brief</a>
+    </div>
+
+    <div class="tier featured">
+      <span class="badge">Join the waitlist</span>
+      <h2>Pro</h2>
+      <div class="price">$19 <small>/ month</small></div>
+      <ul>
+        <li>Everything in Free, much higher brief volume per day</li>
+        <li>Priority research queue (no waiting behind free-tier traffic)</li>
+        <li>Private briefs (opt out of the public permalink)</li>
+        <li>CSV/Markdown export of your whole history</li>
+        <li>Email support</li>
+      </ul>
+      <form class="waitlist-form" method="post" action="/pricing">
+        <input type="hidden" name="tier" value="pro">
+        <input type="email" name="email" placeholder="you@company.com" required>
+        <button class="cta" type="submit">Get early access</button>
+      </form>
+    </div>
+
+    <div class="tier secondary">
+      <span class="badge">Join the waitlist</span>
+      <h2>Team</h2>
+      <div class="price">$49 <small>/ month</small></div>
+      <ul>
+        <li>Everything in Pro, shared across your whole team</li>
+        <li>Shared brief history, not just one browser's cookie</li>
+        <li>Highest research volume, dedicated priority queue</li>
+        <li>Priority support, input on the roadmap</li>
+        <li>Custom/high-volume? <a href="mailto:support@ereboslab.com?subject=Wedgecheck%20Team%20plan">Email us directly</a></li>
+      </ul>
+      <form class="waitlist-form" method="post" action="/pricing">
+        <input type="hidden" name="tier" value="team">
+        <input type="email" name="email" placeholder="you@company.com" required>
+        <button class="cta" type="submit">Get early access</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="faq">
+    <h3>Why isn't Pro/Team checkout live yet?</h3>
+    <p>Wedgecheck is a new product, still pre-revenue. We'd rather tell you that plainly than fake a "Buy now" button with nothing behind it. Join the waitlist and you'll get a real invite the day checkout opens, plus founder pricing for being early.</p>
+    <h3>What counts as "a brief"?</h3>
+    <p>One submitted product URL or description that completes a full research pass and returns a cited report -- the same thing the free form on the homepage already does.</p>
+    <h3>Is Free going away?</h3>
+    <p>No -- Free stays real and usable on its own. Pro/Team exist for people who hit the free rate limit regularly or need team-wide history, not to gate the core product.</p>
+  </div>
+</body>
+</html>
